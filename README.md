@@ -1,5 +1,11 @@
 # pi-provider-qoder
 
+> **⚠️ 仅供学习研究使用（For learning and research purposes only）**
+>
+> 本项目仅用于学习、研究和个人技术探索，不保证稳定性与正确性，请勿用于生产环境或任何商业用途。使用本项目接入第三方 API 时，请遵守相关服务条款与法律法规，风险自负。
+>
+> This project is for **learning and research purposes only**. It is not guaranteed to be stable or correct. Do not use it in production or for any commercial purpose. When connecting to third-party APIs, please comply with the relevant terms of service and applicable laws. Use at your own risk.
+
 A [pi](https://shittycodingagent.ai/) extension that connects pi to the **Qoder AI API** as a pure model provider. It exposes Qoder Global and Qoder China models through the standard pi provider surface, so pi keeps its own agent loop and tools while the underlying model is served by Qoder.
 
 > Based on [simonsmh/pi-provider-qoder](https://github.com/simonsmh/pi-provider-qoder) and the [minglu6 fork](https://github.com/minglu6/pi-provider-qoder) (auth/identity fixes + enterprise VPC support), with **actual reasoning-effort and context-window forwarding** implemented on top.

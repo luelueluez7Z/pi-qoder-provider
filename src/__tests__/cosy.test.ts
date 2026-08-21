@@ -6,6 +6,7 @@ import {
   getQoderCNDirectModel,
   getQoderCNFriendlyModelInfo,
   getQoderExchangeURL,
+  getQoderGlobalDirectModel,
   getQoderManageUrl,
   getQoderModelListURL,
   getQoderOpenApiUrl,
@@ -14,6 +15,7 @@ import {
   getQoderUserEmailFallback,
   getQoderUserInfoURL,
   toQoderCNFriendlyModel,
+  toQoderGlobalFriendlyModel,
 } from "../cosy.js";
 
 describe("getQoderBaseUrl", () => {
@@ -169,5 +171,55 @@ describe("toQoderCNFriendlyModel", () => {
       extra: string;
     });
     expect(result.extra).toBe("field");
+  });
+});
+
+describe("getQoderGlobalDirectModel", () => {
+  it("maps friendly global IDs back to internal keys", () => {
+    expect(getQoderGlobalDirectModel("deepseek-v4-pro")).toBe("dmodel");
+    expect(getQoderGlobalDirectModel("deepseek-v4-flash")).toBe("dfmodel");
+    expect(getQoderGlobalDirectModel("qwen3.7-max")).toBe("qmodel_latest");
+    expect(getQoderGlobalDirectModel("qwen3.7-plus")).toBe("qmodel");
+    expect(getQoderGlobalDirectModel("qwen3.8-max")).toBe("qmodel_38max");
+    expect(getQoderGlobalDirectModel("kimi-k3")).toBe("kmodel_latest");
+    expect(getQoderGlobalDirectModel("kimi-k2.7-code")).toBe("kmodel");
+    expect(getQoderGlobalDirectModel("glm-5.3")).toBe("gmodel");
+    expect(getQoderGlobalDirectModel("glm-5.2")).toBe("gm51model");
+    expect(getQoderGlobalDirectModel("cantus")).toBe("cmodel");
+    expect(getQoderGlobalDirectModel("minimax-m3")).toBe("mmodel");
+    expect(getQoderGlobalDirectModel("ultimate")).toBe("ultimate");
+  });
+
+  it("returns the input ID for unknown models", () => {
+    expect(getQoderGlobalDirectModel("custom-model")).toBe("custom-model");
+  });
+
+  it('defaults to "auto" when no input', () => {
+    expect(getQoderGlobalDirectModel()).toBe("auto");
+    expect(getQoderGlobalDirectModel("")).toBe("auto");
+  });
+});
+
+describe("toQoderGlobalFriendlyModel", () => {
+  it("maps dmodel/dfmodel to friendly names", () => {
+    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-V4-Flash" }).id).toBe("deepseek-v4-flash");
+    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-V4-Flash" }).name).toBe(
+      "DeepSeek V4 Flash (Qoder)",
+    );
+    expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).id).toBe("deepseek-v4-pro");
+    expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).name).toBe("DeepSeek V4 Pro (Qoder)");
+  });
+
+  it("round-trips friendly id back to internal key", () => {
+    const friendly = toQoderGlobalFriendlyModel({ id: "dfmodel", name: "x" });
+    expect(getQoderGlobalDirectModel(friendly.id)).toBe("dfmodel");
+    const friendly2 = toQoderGlobalFriendlyModel({ id: "dmodel", name: "x" });
+    expect(getQoderGlobalDirectModel(friendly2.id)).toBe("dmodel");
+  });
+
+  it("passes through unknown models unchanged", () => {
+    const result = toQoderGlobalFriendlyModel({ id: "custom-model", name: "Custom" });
+    expect(result.id).toBe("custom-model");
+    expect(result.name).toBe("Custom");
   });
 });

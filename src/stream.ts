@@ -20,6 +20,7 @@ import {
   getMachineId,
   getQoderChatURL,
   getQoderCNDirectModel,
+  getQoderGlobalDirectModel,
   getQoderMode,
   getQoderUserEmailFallback,
   isQoderCNMode,
@@ -156,7 +157,9 @@ export function streamQoder(
       const email = identity.email || getQoderUserEmailFallback(providerMode);
       const machineID = identity.machineID || getMachineId();
 
-      const qoderModel = isQoderCNMode(providerMode) ? getQoderCNDirectModel(model.id) : model.id;
+      const qoderModel = isQoderCNMode(providerMode)
+        ? getQoderCNDirectModel(model.id)
+        : getQoderGlobalDirectModel(model.id);
       const modelConfig = getCachedModelConfig(qoderModel, providerMode) || {
         key: qoderModel,
         is_reasoning:

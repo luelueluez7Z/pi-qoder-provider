@@ -286,6 +286,72 @@ export function toQoderCNFriendlyModel<T extends { id: string; name: string }>(m
 }
 
 // ---------------------------------------------------------------------------
+// Global friendly model IDs
+// ---------------------------------------------------------------------------
+
+/** Map a global friendly model id back to the internal Qoder model key. */
+export function getQoderGlobalDirectModel(modelID?: string): string {
+  return (
+    {
+      qoder: "auto",
+      "qoder-auto": "auto",
+      auto: "auto",
+      ultimate: "ultimate",
+      performance: "performance",
+      efficient: "efficient",
+      lite: "lite",
+      cantus: "cmodel",
+      "qwen3.8-max": "qmodel_38max",
+      "qwen3.8-max-preview": "qmodel_38max",
+      "qwen3.7-max": "qmodel_latest",
+      "qwen3.7-plus": "qmodel",
+      "kimi-k3": "kmodel_latest",
+      "kimi-k2.7-code": "kmodel",
+      "glm-5.3": "gmodel",
+      "glm-5.2": "gm51model",
+      "deepseek-v4-pro": "dmodel",
+      "deepseek-v4-flash": "dfmodel",
+      "minimax-m3": "mmodel",
+    }[modelID || ""] ||
+    modelID ||
+    "auto"
+  );
+}
+
+const GLOBAL_FRIENDLY_MODELS: Record<string, { id: string; name: string }> = {
+  auto: { id: "auto", name: "Qoder Auto" },
+  ultimate: { id: "ultimate", name: "Qoder Ultimate" },
+  performance: { id: "performance", name: "Qoder Performance" },
+  efficient: { id: "efficient", name: "Qoder Efficient" },
+  lite: { id: "lite", name: "Qoder Lite" },
+  cmodel: { id: "cantus", name: "Cantus (Qoder)" },
+  qmodel_38max: { id: "qwen3.8-max", name: "Qwen 3.8 Max (Qoder)" },
+  qmodel_preview: { id: "qwen3.8-max-preview", name: "Qwen 3.8 Max Preview (Qoder)" },
+  qmodel_latest: { id: "qwen3.7-max", name: "Qwen 3.7 Max (Qoder)" },
+  qmodel: { id: "qwen3.7-plus", name: "Qwen 3.7 Plus (Qoder)" },
+  kmodel_latest: { id: "kimi-k3", name: "Kimi K3 (Qoder)" },
+  kmodel: { id: "kimi-k2.7-code", name: "Kimi K2.7 Code (Qoder)" },
+  gmodel: { id: "glm-5.3", name: "GLM 5.3 (Qoder)" },
+  gm51model: { id: "glm-5.2", name: "GLM 5.2 (Qoder)" },
+  dmodel: { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro (Qoder)" },
+  dfmodel: { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash (Qoder)" },
+  mmodel: { id: "minimax-m3", name: "MiniMax M3 (Qoder)" },
+};
+
+export function getQoderGlobalFriendlyModelInfo(key: string, display?: string): { id: string; name: string } {
+  return GLOBAL_FRIENDLY_MODELS[key] || { id: key, name: display || key };
+}
+
+export function toQoderGlobalFriendlyModel<T extends { id: string; name: string }>(model: T): T {
+  const info = getQoderGlobalFriendlyModelInfo(model.id, model.name);
+  return {
+    ...model,
+    id: info.id,
+    name: info.name,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Crypto primitives
 // ---------------------------------------------------------------------------
 

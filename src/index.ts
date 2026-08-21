@@ -6,6 +6,7 @@ import {
   getQoderUserEmailFallback,
   isQoderCNMode,
   toQoderCNFriendlyModel,
+  toQoderGlobalFriendlyModel,
 } from "./cosy.js";
 import {
   getCachedModels,
@@ -37,7 +38,7 @@ function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
   const modelsToUse = cached.length > 0 ? cached : isQoderCNMode(mode) ? staticCnModels : staticModels;
 
   return modelsToUse.map((m) => {
-    const model = isQoderCNMode(mode) ? toQoderCNFriendlyModel(m) : m;
+    const model = isQoderCNMode(mode) ? toQoderCNFriendlyModel(m) : toQoderGlobalFriendlyModel(m);
     const out: Record<string, unknown> = {
       ...model,
       provider: providerID,
