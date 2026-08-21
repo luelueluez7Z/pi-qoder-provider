@@ -128,7 +128,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "qmodel",
-    name: "Qwen3.7 Plus (Qoder)",
+    name: "Qwen3.7 Plus",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -141,7 +141,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "cmodel",
-    name: "Cantus (Qoder)",
+    name: "Cantus",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -154,7 +154,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "qmodel_preview",
-    name: "Qwen3.8 Max Preview (Qoder)",
+    name: "Qwen3.8 Max Preview",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -167,7 +167,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "qmodel_latest",
-    name: "Qwen3.7 Max (Qoder)",
+    name: "Qwen3.7 Max",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -180,7 +180,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "dmodel",
-    name: "DeepSeek V4 Pro (Qoder)",
+    name: "DeepSeek V4 Pro",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -194,7 +194,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "dfmodel",
-    name: "DeepSeek V4 Flash (Qoder)",
+    name: "DeepSeek V4 Flash",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -208,7 +208,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "gm51model",
-    name: "GLM 5.2 (Qoder)",
+    name: "GLM 5.2",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -221,7 +221,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "kmodel",
-    name: "Kimi K2.7 Code (Qoder)",
+    name: "Kimi K2.7 Code",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -234,7 +234,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "kmodel_latest",
-    name: "Kimi K3 (Qoder)",
+    name: "Kimi K3",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",
@@ -247,7 +247,7 @@ export const staticModels: QoderModelDef[] = [
   },
   {
     id: "mmodel",
-    name: "MiniMax M3 (Qoder)",
+    name: "MiniMax M3",
     api: "qoder-api",
     provider: "qoder",
     baseUrl: "https://api3.qoder.sh/",

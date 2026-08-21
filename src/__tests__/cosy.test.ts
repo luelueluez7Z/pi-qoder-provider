@@ -203,11 +203,9 @@ describe("getQoderGlobalDirectModel", () => {
 describe("toQoderGlobalFriendlyModel", () => {
   it("maps dmodel/dfmodel to friendly names", () => {
     expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-V4-Flash" }).id).toBe("deepseek-v4-flash");
-    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-V4-Flash" }).name).toBe(
-      "DeepSeek V4 Flash (Qoder)",
-    );
+    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-V4-Flash" }).name).toBe("DeepSeek V4 Flash");
     expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).id).toBe("deepseek-v4-pro");
-    expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).name).toBe("DeepSeek V4 Pro (Qoder)");
+    expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).name).toBe("DeepSeek V4 Pro");
   });
 
   it("round-trips friendly id back to internal key", () => {
