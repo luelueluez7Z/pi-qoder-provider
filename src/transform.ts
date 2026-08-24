@@ -70,6 +70,9 @@ export function transformTools(tools: Tool[]): QoderTool[] {
 
 export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
   const normalizedMessages: QoderMessage[] = [];
+  // tool_call_id → index (in normalizedMessages) of the assistant message that
+  // issued it. An entry is removed as soon as the matching tool message arrives.
+  const pendingToolCallIds = new Map<string, number>();
 
   for (const msg of messages) {
     // Skip failed assistant messages.
@@ -136,10 +139,20 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
         role: "assistant",
         content: content || (toolCalls.length > 0 ? " " : null),
       };
-      if (toolCalls.length > 0) mapped.tool_calls = toolCalls;
+      if (toolCalls.length > 0) {
+        mapped.tool_calls = toolCalls;
+        for (const tc of toolCalls) {
+          if (tc.id) pendingToolCallIds.set(tc.id, normalizedMessages.length);
+        }
+      }
       normalizedMessages.push(mapped);
     } else if (msg.role === "toolResult") {
       const tr = msg as ToolResultMessage;
+      // A tool result whose tool_call_id has no pending assistant message is
+      // orphaned (its assistant message was skipped as aborted/errored). The
+      // upstream rejects such messages, so drop them.
+      if (!tr.toolCallId || !pendingToolCallIds.has(tr.toolCallId)) continue;
+      pendingToolCallIds.delete(tr.toolCallId);
       normalizedMessages.push({
         role: "tool",
         tool_call_id: tr.toolCallId,
@@ -167,6 +180,37 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
           ],
         });
       }
+    }
+  }
+
+  // Sanitize interrupted turns: an assistant message whose tool_calls were never
+  // answered (e.g. an aborted/errored turn still present in the history) would
+  // make the upstream reject the whole request with "an assistant message with
+  // tool_calls must be followed by tool messages". Drop the unanswered tool
+  // calls; drop the whole message when it carries no other content.
+  for (let i = 0; i < normalizedMessages.length; i++) {
+    const m = normalizedMessages[i];
+    if (m.role !== "assistant" || !m.tool_calls || m.tool_calls.length === 0) continue;
+    const answered = m.tool_calls.filter((tc) => tc.id && !pendingToolCallIds.has(tc.id));
+    if (answered.length === m.tool_calls.length) continue;
+    if (answered.length > 0) {
+      if (process.env.QODER_DEBUG) {
+        console.warn(
+          `[pi-provider-qoder] dropped ${m.tool_calls.length - answered.length} unanswered tool call(s) from assistant message`,
+        );
+      }
+      m.tool_calls = answered;
+      continue;
+    }
+    const content = typeof m.content === "string" ? m.content : "";
+    if (content.trim() === "") {
+      if (process.env.QODER_DEBUG) {
+        console.warn("[pi-provider-qoder] dropped assistant message with unanswered tool calls (interrupted turn)");
+      }
+      normalizedMessages.splice(i, 1);
+      i--;
+    } else {
+      delete m.tool_calls;
     }
   }
 

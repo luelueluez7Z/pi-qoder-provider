@@ -130,6 +130,7 @@ describe("transformMessagesForQoder", () => {
           },
         ],
       },
+      { role: "toolResult", toolCallId: "call_1", content: "file content" },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
     expect(result[0].role).toBe("assistant");
@@ -168,13 +169,17 @@ describe("transformMessagesForQoder", () => {
   it("handles toolResult messages", () => {
     const msgs = [
       {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "x" } }],
+      },
+      {
         role: "toolResult",
         toolCallId: "call_1",
         content: "file content here",
       },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
-    expect(result[0]).toEqual({
+    expect(result[1]).toEqual({
       role: "tool",
       tool_call_id: "call_1",
       content: "file content here",
@@ -183,6 +188,10 @@ describe("transformMessagesForQoder", () => {
 
   it("forwards images returned by a tool call as a user message", () => {
     const msgs = [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_1", name: "read_image", arguments: { path: "x" } }],
+      },
       {
         role: "toolResult",
         toolCallId: "call_1",
@@ -194,14 +203,14 @@ describe("transformMessagesForQoder", () => {
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
 
-    expect(result).toHaveLength(2);
-    expect(result[0]).toEqual({
+    expect(result).toHaveLength(3);
+    expect(result[1]).toEqual({
       role: "tool",
       tool_call_id: "call_1",
       content: "Read image file [image/png]",
     });
-    expect(result[1].role).toBe("user");
-    const parts = result[1].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    expect(result[2].role).toBe("user");
+    const parts = result[2].content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
     expect(parts[0]).toEqual({
       type: "text",
       text: "[1 image returned by the previous tool call]",
@@ -215,14 +224,18 @@ describe("transformMessagesForQoder", () => {
   it("adds no extra message when a tool result has no images", () => {
     const msgs = [
       {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_1", name: "read_file", arguments: { path: "x" } }],
+      },
+      {
         role: "toolResult",
         toolCallId: "call_1",
         content: [{ type: "text", text: "plain text result" }],
       },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
-    expect(result).toHaveLength(1);
-    expect(result[0].role).toBe("tool");
+    expect(result).toHaveLength(2);
+    expect(result[1].role).toBe("tool");
   });
 
   it("uses a placeholder content for assistant messages with only tool calls (gateway workaround)", () => {
@@ -231,6 +244,7 @@ describe("transformMessagesForQoder", () => {
         role: "assistant",
         content: [{ type: "toolCall", id: "c1", name: "fn", arguments: {} }],
       },
+      { role: "toolResult", toolCallId: "c1", content: "result" },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
     const msg0 = result[0] as { role: string; content: unknown; tool_calls?: unknown[] };
@@ -266,5 +280,66 @@ describe("transformMessagesForQoder", () => {
     expect(asst.tool_calls?.[0].id).toBe("call_abc123");
     expect(tool.role).toBe("tool");
     expect(tool.tool_call_id).toBe("call_abc123");
+  });
+
+  it("drops an assistant message whose tool calls were never answered (interrupted turn)", () => {
+    // A turn ended with the model emitting tool calls but no tool result was
+    // ever recorded (e.g. abort mid-execution). Replaying this history would
+    // 400 with "assistant message with tool_calls must be followed by tool
+    // messages", so the dangling assistant message must not reach the upstream.
+    const msgs = [
+      { role: "user", content: "fix the bug" },
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [{ type: "toolCall", id: "call_orphan", name: "bash", arguments: { command: "git status" } }],
+      },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].role).toBe("user");
+  });
+
+  it("keeps only the tool calls that have a result when a turn was partially executed", () => {
+    const msgs = [
+      { role: "user", content: "run both" },
+      {
+        role: "assistant",
+        stopReason: "toolUse",
+        content: [
+          { type: "toolCall", id: "call_a", name: "bash", arguments: { command: "a" } },
+          { type: "toolCall", id: "call_b", name: "bash", arguments: { command: "b" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "call_a", content: "result of a" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result).toHaveLength(3);
+    const asst = result[1] as { role: string; tool_calls?: Array<{ id?: string }> };
+    expect(asst.role).toBe("assistant");
+    expect(asst.tool_calls).toHaveLength(1);
+    expect(asst.tool_calls?.[0].id).toBe("call_a");
+    expect(result[2]).toMatchObject({ role: "tool", tool_call_id: "call_a" });
+  });
+
+  it("drops tool results whose assistant message was skipped (aborted)", () => {
+    // The aborted assistant message is skipped, so its tool result would be an
+    // orphaned `tool` message with no preceding tool_calls — also rejected by
+    // the upstream. It must be dropped together with the assistant message.
+    const msgs = [
+      { role: "user", content: "do it" },
+      {
+        role: "assistant",
+        stopReason: "aborted",
+        content: [{ type: "toolCall", id: "call_ab", name: "bash", arguments: { command: "ls" } }],
+      },
+      { role: "toolResult", toolCallId: "call_ab", content: "ran before abort" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(msgs);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].role).toBe("user");
   });
 });

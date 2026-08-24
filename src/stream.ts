@@ -343,6 +343,12 @@ export function streamQoder(
           try {
             const envelope = JSON.parse(dataStr);
             if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+              if (process.env.QODER_DEBUG) {
+                console.error(
+                  "[pi-provider-qoder] upstream error, sent messages:",
+                  JSON.stringify(reqBody.messages, null, 2),
+                );
+              }
               throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
             }
 
