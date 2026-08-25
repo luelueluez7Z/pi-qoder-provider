@@ -364,6 +364,8 @@ export function streamQoder(
                 prompt_tokens?: number;
                 completion_tokens?: number;
                 total_tokens?: number;
+                credits?: number;
+                original_credits?: number;
                 completion_tokens_details?: { reasoning_tokens?: number };
                 prompt_tokens_details?: {
                   cacheable_tokens?: number;
@@ -383,6 +385,25 @@ export function streamQoder(
               output.usage.totalTokens = u.total_tokens ?? 0;
               output.usage.cacheRead = cacheReadTokens;
               output.usage.cacheWrite = cacheWriteTokens;
+
+              // Qoder is credit-based: the request's SSE tail reports the credits it
+              // consumed (usage.credits). Fold that into usage.cost so pi's footer
+              // accumulates the session's total credit spend ($x.xxx). Split
+              // input/output by token share so the cost total stays exact while
+              // per-token numbers remain sane for pi's cache-stats.
+              const credits = u.credits ?? 0;
+              if (credits > 0) {
+                const billedTokens =
+                  output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+                if (billedTokens > 0) {
+                  const inputShare = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
+                  output.usage.cost.input = (credits * inputShare) / billedTokens;
+                  output.usage.cost.output = (credits * output.usage.output) / billedTokens;
+                } else {
+                  output.usage.cost.input = credits;
+                }
+                output.usage.cost.total = credits;
+              }
             }
 
             if (inner.choices && inner.choices.length > 0) {

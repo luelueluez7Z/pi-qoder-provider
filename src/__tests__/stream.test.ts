@@ -191,6 +191,52 @@ describe("streamQoder", () => {
     expect(msg.usage.cacheWrite).toBe(10);
   });
 
+  it("folds Qoder credits into usage.cost for footer accumulation", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
+      sseEnvelope(
+        finishChunk("stop", {
+          usage: {
+            prompt_tokens: 13,
+            completion_tokens: 11,
+            total_tokens: 24,
+            billable: true,
+            credits: 0.0007885714285714286,
+            original_credits: 0.0007885714285714286,
+            prompt_tokens_details: { cached_tokens: 0 },
+          },
+        }),
+      ) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = (done as { message: AssistantMessage }).message;
+    // total must equal the upstream credits so pi's footer accumulates them.
+    expect(msg.usage.cost.total).toBeCloseTo(0.0007885714285714286, 12);
+    // input/output split by token share (13 prompt / 24 total, 11 completion / 24 total).
+    expect(msg.usage.cost.input).toBeCloseTo((0.0007885714285714286 * 13) / 24, 12);
+    expect(msg.usage.cost.output).toBeCloseTo((0.0007885714285714286 * 11) / 24, 12);
+  });
+
+  it("keeps cost zeroed when the usage tail carries no credits", async () => {
+    const sse =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) +
+      sseEnvelope(finishChunk("stop", { usage: { prompt_tokens: 13, completion_tokens: 11, total_tokens: 24 } })) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const done = events.find((e) => e.type === "done");
+    const msg = (done as { message: AssistantMessage }).message;
+    expect(msg.usage.cost.total).toBe(0);
+    expect(msg.usage.cost.input).toBe(0);
+    expect(msg.usage.cost.output).toBe(0);
+  });
+
   it("reports a tool_use stop reason when the stream emits tool calls", async () => {
     const sse =
       sseEnvelope(
