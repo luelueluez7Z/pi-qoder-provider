@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatQoderUpstreamError,
   getQoderBaseUrl,
   getQoderCenterUrl,
   getQoderChatURL,
@@ -14,6 +15,7 @@ import {
   getQoderUsageURL,
   getQoderUserEmailFallback,
   getQoderUserInfoURL,
+  parseQoderUpstreamError,
   toQoderCNFriendlyModel,
   toQoderGlobalFriendlyModel,
 } from "../cosy.js";
@@ -219,5 +221,107 @@ describe("toQoderGlobalFriendlyModel", () => {
     const result = toQoderGlobalFriendlyModel({ id: "custom-model", name: "Custom" });
     expect(result.id).toBe("custom-model");
     expect(result.name).toBe("Custom");
+  });
+});
+
+describe("parseQoderUpstreamError", () => {
+  const queuedBody = JSON.stringify({
+    code: "403",
+    message: JSON.stringify({
+      code: "10605",
+      message: JSON.stringify({
+        isQueued: true,
+        modelKey: "kmodel_latest",
+        queueCount: 1033,
+        queueType: "slow",
+        retryAfterSeconds: 30,
+        serviceAvailable: true,
+        waitTime: 316,
+      }),
+    }),
+  });
+
+  it("unwraps the 10605 queue payload", () => {
+    const info = parseQoderUpstreamError(queuedBody);
+    expect(info?.code).toBe("10605");
+    expect(info?.queue?.isQueued).toBe(true);
+    expect(info?.queue?.modelKey).toBe("kmodel_latest");
+    expect(info?.queue?.queueCount).toBe(1033);
+    expect(info?.queue?.retryAfterSeconds).toBe(30);
+    expect(info?.queue?.serviceAvailable).toBe(true);
+  });
+
+  it("surfaces a plain business code without queue", () => {
+    const info = parseQoderUpstreamError(
+      JSON.stringify({ code: "403", message: JSON.stringify({ code: "429", message: "model busy" }) }),
+    );
+    expect(info?.code).toBe("429");
+    expect(info?.queue).toBeUndefined();
+  });
+
+  it("returns null for non-JSON bodies", () => {
+    expect(parseQoderUpstreamError("not json")).toBeNull();
+  });
+});
+
+describe("formatQoderUpstreamError", () => {
+  const queuedBody = JSON.stringify({
+    code: "403",
+    message: JSON.stringify({
+      code: "10605",
+      message: JSON.stringify({
+        isQueued: true,
+        modelKey: "kmodel_latest",
+        queueCount: 1033,
+        queueType: "slow",
+        retryAfterSeconds: 30,
+        serviceAvailable: true,
+        waitTime: 316,
+      }),
+    }),
+  });
+
+  it("formats 10605 with model name and queue info", () => {
+    const msg = formatQoderUpstreamError(403, queuedBody, "Kimi K3");
+    expect(msg).toContain("Kimi K3");
+    expect(msg).toContain("正在排队");
+    expect(msg).toContain("1033");
+    expect(msg).toContain("30 秒");
+    expect(msg).toContain("DeepSeek V4");
+  });
+
+  it("formats 10605 without queue count when zero", () => {
+    const body = JSON.stringify({
+      code: "403",
+      message: JSON.stringify({
+        code: "10605",
+        message: JSON.stringify({
+          isQueued: false,
+          modelKey: "kmodel_latest",
+          queueCount: 0,
+          queueType: "slow",
+          retryAfterSeconds: 5,
+          serviceAvailable: true,
+          waitTime: 0,
+        }),
+      }),
+    });
+    const msg = formatQoderUpstreamError(403, body, "Kimi K3");
+    expect(msg).not.toContain("队列中约 0");
+    expect(msg).toContain("5 秒");
+  });
+
+  it("maps known business codes to Chinese hints", () => {
+    const msg = formatQoderUpstreamError(
+      403,
+      JSON.stringify({ code: "403", message: JSON.stringify({ code: "429", message: "busy" }) }),
+    );
+    expect(msg).toContain("繁忙");
+    expect(msg).toContain("429");
+  });
+
+  it("falls back to raw body for unknown codes", () => {
+    const msg = formatQoderUpstreamError(500, JSON.stringify({ code: "99999", message: "boom" }));
+    expect(msg).toContain("boom");
   });
 });

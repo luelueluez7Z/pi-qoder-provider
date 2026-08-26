@@ -17,6 +17,7 @@ import * as PiAi from "@earendil-works/pi-ai";
 import {
   buildAuthHeaders,
   formatQoderHttpError,
+  formatQoderUpstreamError,
   getMachineId,
   getQoderChatURL,
   getQoderCNDirectModel,
@@ -349,7 +350,7 @@ export function streamQoder(
                   JSON.stringify(reqBody.messages, null, 2),
                 );
               }
-              throw new Error(`Upstream status ${envelope.statusCodeValue}: ${envelope.body}`);
+              throw new Error(formatQoderUpstreamError(envelope.statusCodeValue, envelope.body, model.name));
             }
 
             const innerStr = envelope.body;

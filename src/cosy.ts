@@ -567,3 +567,112 @@ export function formatQoderHttpError(
 
   return hints.length > 0 ? `${base} Hint: ${hints.join(" ")}` : base;
 }
+
+// ---------------------------------------------------------------------------
+// Upstream (SSE envelope) error parsing + friendly messages
+// ---------------------------------------------------------------------------
+
+/** Queue state returned inside the 10605 "model queued" error payload. */
+export interface QoderQueueInfo {
+  isQueued?: boolean;
+  modelKey?: string;
+  queueCount?: number;
+  queueType?: string;
+  retryAfterSeconds?: number;
+  serviceAvailable?: boolean;
+  waitTime?: number;
+}
+
+export interface QoderUpstreamErrorInfo {
+  code: string;
+  message?: string;
+  queue?: QoderQueueInfo;
+}
+
+/**
+ * Qoder reports business errors inside the SSE envelope as deeply nested JSON:
+ *   { "code":"403", "message":"{\"code\":\"10605\",\"message\":\"{...queue...}\"}" }
+ * Unwrap the layers and surface the innermost code plus the queue state.
+ * Returns null when the body is not this envelope shape.
+ */
+export function parseQoderUpstreamError(body: string): QoderUpstreamErrorInfo | null {
+  try {
+    const outer = JSON.parse(body) as Record<string, unknown>;
+    const code = typeof outer.code === "string" ? outer.code : String(outer?.code ?? "");
+
+    let inner: Record<string, unknown> | null = null;
+    try {
+      inner = typeof outer.message === "string" ? (JSON.parse(outer.message) as Record<string, unknown>) : null;
+    } catch {}
+
+    const finalCode = inner && typeof inner.code === "string" ? inner.code : code;
+    if (inner && typeof inner.message === "string") {
+      try {
+        const queue = JSON.parse(inner.message) as QoderQueueInfo;
+        if (
+          queue &&
+          (queue.isQueued !== undefined || queue.modelKey !== undefined || queue.retryAfterSeconds !== undefined)
+        ) {
+          return { code: finalCode, message: inner.message, queue };
+        }
+      } catch {}
+    }
+
+    const fallbackMessage = typeof outer.message === "string" ? outer.message : undefined;
+    return {
+      code: finalCode,
+      message: (inner && typeof inner.message === "string" ? inner.message : undefined) ?? fallbackMessage,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Friendly Chinese hints for the most common Qoder business error codes. */
+const QODER_ERROR_HINTS: Record<string, string> = {
+  "101": "请求签名无效，请重试。",
+  "102": "请求超时，请稍后重试。",
+  "103": "重复的请求 ID，请重试。",
+  "105": "登录已过期，请重新登录后再试。",
+  "110": "今日聊天额度已用完，请明天再试或升级套餐。",
+  "112": "积分额度已用完，请升级订阅套餐获取更多资源。",
+  "113": "已达到用量上限，请升级订阅套餐。",
+  "115": "本月 Lite 模型额度已用完，请升级套餐。",
+  "116": "积分已用完，将在下个周期重置，或可前往官网购买积分。",
+  "117": "积分已用完，可联系管理员或前往官网查看用量。",
+  "118": "积分已用完：新用户请等待 3-5 分钟免费额度到账，订阅用户等待下个周期重置。",
+  "119": "今日 Qwen-Coder-Qoder 模型免费额度已用完，升级套餐可解锁更多模型。",
+  "406": "会话包含敏感内容被拒绝，请切换模型或新开一个会话。",
+  "408": "响应超时，请重试。",
+  "409": "上游发生错误，请重试。",
+  "416": "会话可能触发了模型安全策略，请切换模型或新开会话。",
+  "429": "当前模型繁忙，请稍后重试或切换到其他模型。",
+  "500": "上游服务器错误，请稍后重试。",
+  "80404": "该模型在社区版不可用，请切换到已配置的自定义模型。",
+  "90000": "当前或历史消息包含图片，但所选模型不支持图片输入，请切换模型或新开会话。",
+  "48711": "该操作需要升级订阅套餐。",
+  "48712": "所选模型不受支持。",
+  "48713": "所选模型当前不可用。",
+};
+
+/** Format an SSE-envelope upstream error into a readable message. */
+export function formatQoderUpstreamError(status: number, body: string, modelName?: string): string {
+  const info = parseQoderUpstreamError(body);
+  if (!info) return `Upstream status ${status}: ${body}`;
+
+  if (info.code === "10605" && info.queue) {
+    const q = info.queue;
+    const waitSec = typeof q.retryAfterSeconds === "number" ? q.retryAfterSeconds : 30;
+    const queueCount = typeof q.queueCount === "number" && q.queueCount > 0 ? q.queueCount : undefined;
+    const model = modelName || (q.modelKey ? q.modelKey : "当前模型");
+    const queuePart = queueCount !== undefined ? `（队列中约 ${queueCount} 个请求）` : "";
+    return (
+      `${model} 当前正在排队${queuePart}，暂时无法响应，预计等待约 ${waitSec} 秒。` +
+      `请稍后重试，或切换到其他模型（如 DeepSeek V4 Pro / Flash）。`
+    );
+  }
+
+  const hint = QODER_ERROR_HINTS[info.code];
+  if (hint) return `${hint}（错误码 ${info.code}）`;
+  return `Qoder 上游返回错误（HTTP ${status}${info.code ? `，错误码 ${info.code}` : ""}）: ${info.message || body}`;
+}
