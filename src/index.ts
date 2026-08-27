@@ -1,4 +1,4 @@
-import type { Api, Model, OAuthCredentials } from "@earendil-works/pi-ai";
+import type { Api, Model, OAuthCredentials, RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ProviderConfig } from "@earendil-works/pi-coding-agent";
 import {
   getQoderBaseUrl,
@@ -9,6 +9,7 @@ import {
   toQoderGlobalFriendlyModel,
 } from "./cosy.js";
 import {
+  formatQoderPriceFactor,
   getCachedModels,
   isCacheStale,
   qoderThinkingLevelMap,
@@ -39,8 +40,14 @@ function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
 
   return modelsToUse.map((m) => {
     const model = isQoderCNMode(mode) ? toQoderCNFriendlyModel(m) : toQoderGlobalFriendlyModel(m);
+    // Append the relative credit multiplier (price_factor) to the display name
+    // so the /model selector's "Model Name:" line shows it, e.g.
+    // "DeepSeek V4 Pro · ×0.8". The multiplier is live-refreshed via
+    // refreshModels whenever /model opens.
+    const name = `${model.name}${formatQoderPriceFactor(m.priceFactor)}`;
     const out: Record<string, unknown> = {
       ...model,
+      name,
       provider: providerID,
       baseUrl: getQoderBaseUrl(mode),
     };
@@ -50,6 +57,37 @@ function modelsForProvider(mode: string, providerID: string): Model<Api>[] {
     if (model.thinking) out.thinkingLevelMap = qoderThinkingLevelMap(model);
     return out as unknown as Model<Api>;
   });
+}
+
+/**
+ * Live model catalog refresh invoked by pi's /model (and --list-models). When
+ * network access + an OAuth credential are available, re-pull /model/list so
+ * the displayed credit multipliers (price_factor) are never stale; otherwise
+ * fall back to the current cache. Always returns the latest known model list.
+ */
+async function refreshQoderModels(
+  mode: string,
+  providerID: string,
+  context: RefreshModelsContext,
+): Promise<NonNullable<ProviderConfig["models"]>> {
+  const accessToken = context.credential?.type === "oauth" ? context.credential.access : undefined;
+  if (context.allowNetwork && accessToken) {
+    try {
+      const identity = await resolveQoderIdentity(accessToken, providerID, mode);
+      if (identity?.userID) {
+        await updateQoderModelsCache(
+          accessToken,
+          identity.userID,
+          identity.name || (isQoderCNMode(mode) ? "Qoder CN User" : "Qoder User"),
+          identity.email || getQoderUserEmailFallback(mode),
+          mode,
+        );
+      }
+    } catch {
+      // Best-effort: fall back to the existing cache / static models.
+    }
+  }
+  return modelsForProvider(mode, providerID) as NonNullable<ProviderConfig["models"]>;
 }
 
 function oauthDisplayName(providerID: string, mode: string): string {
@@ -80,12 +118,13 @@ function createQoderOAuth(providerID: string, mode: string): OAuthConfigWithUsag
 function modelConfigForProvider(
   mode: string,
   providerID: string,
-): Pick<ProviderConfig, "api" | "baseUrl" | "models" | "oauth"> {
+): Pick<ProviderConfig, "api" | "baseUrl" | "models" | "oauth" | "refreshModels"> {
   return {
     baseUrl: getQoderBaseUrl(mode),
     api: "qoder-api" as Api,
     models: modelsForProvider(mode, providerID) as unknown as ProviderConfig["models"],
     oauth: createQoderOAuth(providerID, mode) as ProviderConfig["oauth"],
+    refreshModels: (context: RefreshModelsContext) => refreshQoderModels(mode, providerID, context),
   };
 }
 

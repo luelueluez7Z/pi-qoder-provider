@@ -30,6 +30,8 @@ export interface QoderModelEntry {
   context_config?: Record<string, { token_count?: number; is_default?: boolean }>;
   is_vl?: boolean;
   is_reasoning?: boolean;
+  /** Relative credit multiplier (× the base plan price). 0 = free, 1 = base. */
+  price_factor?: number;
   thinking_config?: {
     enabled?: {
       efforts?: Record<string, { description?: string; is_default?: boolean }>;
@@ -53,7 +55,20 @@ export interface QoderModelDef {
   cost: typeof ZERO_COST;
   contextWindow: number;
   maxTokens: number;
+  /** Relative credit multiplier from /model/list (× base plan price). */
+  priceFactor?: number;
   description?: string;
+}
+
+/**
+ * Format a Qoder price factor (relative credit multiplier) for display, e.g.
+ * `1` -> " · ×1", `1.6` -> " · ×1.6", `0` -> " · ×0". Returns "" when the
+ * factor is unknown so the model name stays clean.
+ */
+export function formatQoderPriceFactor(pf: number | undefined): string {
+  if (pf === undefined || Number.isNaN(pf)) return "";
+  const text = Number.isInteger(pf) ? String(pf) : pf.toFixed(2).replace(/\.?0+$/, "");
+  return ` · ×${text}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -73,6 +88,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 180000,
     maxTokens: 32768,
+    priceFactor: 1,
   },
   {
     id: "ultimate",
@@ -86,6 +102,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 1.6,
   },
   {
     id: "performance",
@@ -99,6 +116,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 1.1,
   },
   {
     id: "efficient",
@@ -112,6 +130,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 180000,
     maxTokens: 32768,
+    priceFactor: 0.3,
   },
   {
     id: "lite",
@@ -125,6 +144,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 180000,
     maxTokens: 32768,
+    priceFactor: 0,
   },
   {
     id: "qmodel",
@@ -138,6 +158,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.1,
   },
   {
     id: "cmodel",
@@ -151,6 +172,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 3.2,
   },
   {
     id: "qmodel_preview",
@@ -164,6 +186,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.5,
   },
   {
     id: "qmodel_latest",
@@ -177,6 +200,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.5,
   },
   {
     id: "dmodel",
@@ -191,6 +215,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.8,
   },
   {
     id: "dfmodel",
@@ -205,6 +230,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.3,
   },
   {
     id: "gm51model",
@@ -218,6 +244,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.5,
   },
   {
     id: "kmodel",
@@ -231,6 +258,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 256000,
     maxTokens: 32768,
+    priceFactor: 0.3,
   },
   {
     id: "kmodel_latest",
@@ -244,6 +272,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.8,
   },
   {
     id: "mmodel",
@@ -257,6 +286,7 @@ export const staticModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.2,
   },
 ];
 
@@ -273,6 +303,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 180000,
     maxTokens: 32768,
+    priceFactor: 1,
     description: "Qoder CN smart routing; live catalog reports 180K max input.",
   },
   {
@@ -287,6 +318,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.5,
     description: "Qoder CN qmodel_latest; context options 200K/400K/1M.",
   },
   {
@@ -301,6 +333,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.1,
     description: "Qoder CN qmodel; context options 200K/400K/1M.",
   },
   {
@@ -315,6 +348,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.1,
     description: "Qoder CN q36fmodel; context options 200K/400K/1M.",
   },
   {
@@ -330,6 +364,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.8,
     description: "Qoder CN dmodel; context options 200K/400K/1M.",
   },
   {
@@ -345,6 +380,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 1000000,
     maxTokens: 32768,
+    priceFactor: 0.3,
     description: "Qoder CN dfmodel; context options 200K/400K/1M.",
   },
   {
@@ -359,6 +395,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 200000,
     maxTokens: 32768,
+    priceFactor: 0.5,
     description: "Qoder CN gm51model; live catalog currently displays GLM-5.2 with 200K context.",
   },
   {
@@ -373,6 +410,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 256000,
     maxTokens: 32768,
+    priceFactor: 0.3,
     description: "Qoder CN kmodel; context option 256K.",
   },
   {
@@ -387,6 +425,7 @@ export const staticCnModels: QoderModelDef[] = [
     cost: ZERO_COST,
     contextWindow: 200000,
     maxTokens: 32768,
+    priceFactor: 0.2,
     description: "Qoder CN mmodel; live catalog reports 200K context.",
   },
 ];
@@ -576,6 +615,7 @@ export async function updateQoderModelsCache(
       const isReasoning = !!entry.is_reasoning || !!entry.thinking_config;
       const supportsEffort = !!entry.thinking_config?.enabled?.efforts;
       const thinking = deriveQoderThinking(entry, isReasoning);
+      const priceFactor = typeof entry.price_factor === "number" ? entry.price_factor : undefined;
       const modelInfo = isQoderCNMode(mode) ? getQoderCNFriendlyModelInfo(key, display) : { id: key, name: display };
 
       configs[key] = entry;
@@ -594,6 +634,7 @@ export async function updateQoderModelsCache(
         cost: ZERO_COST,
         contextWindow: ctxLen,
         maxTokens: entry.max_output_tokens || 32768,
+        ...(priceFactor !== undefined ? { priceFactor } : {}),
       });
     }
 
@@ -611,6 +652,7 @@ export async function updateQoderModelsCache(
         cost: ZERO_COST,
         contextWindow: 180000,
         maxTokens: 32768,
+        priceFactor: 1,
       });
     }
 

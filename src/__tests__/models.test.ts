@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { deriveQoderThinking, getCachedModelConfig, staticCnModels, staticModels, ZERO_COST } from "../models.js";
+import {
+  deriveQoderThinking,
+  formatQoderPriceFactor,
+  getCachedModelConfig,
+  staticCnModels,
+  staticModels,
+  ZERO_COST,
+} from "../models.js";
 
 describe("static model catalogs", () => {
   it("global catalog exposes tier models", () => {
@@ -60,6 +67,26 @@ describe("static model catalogs", () => {
     expect(dfmodel?.input).toEqual(["text", "image"]);
   });
 
+  it("static catalogs carry price factors mirroring the live /model/list", () => {
+    const byId = (id: string) => staticModels.find((m) => m.id === id)?.priceFactor;
+    expect(byId("auto")).toBe(1);
+    expect(byId("ultimate")).toBe(1.6);
+    expect(byId("performance")).toBe(1.1);
+    expect(byId("efficient")).toBe(0.3);
+    expect(byId("lite")).toBe(0);
+    expect(byId("cmodel")).toBe(3.2);
+    expect(byId("dmodel")).toBe(0.8);
+    expect(byId("dfmodel")).toBe(0.3);
+    expect(byId("qmodel_latest")).toBe(0.5);
+    expect(byId("qmodel")).toBe(0.1);
+
+    const cnByFriendly = (id: string) => staticCnModels.find((m) => m.id === id)?.priceFactor;
+    expect(cnByFriendly("auto")).toBe(1);
+    expect(cnByFriendly("qwen3.7-max")).toBe(0.5);
+    expect(cnByFriendly("deepseek-v4-pro")).toBe(0.8);
+    expect(cnByFriendly("deepseek-v4-flash")).toBe(0.3);
+  });
+
   it("CN DeepSeek V4 models are text-only", () => {
     const pro = staticCnModels.find((m) => m.id === "deepseek-v4-pro");
     const flash = staticCnModels.find((m) => m.id === "deepseek-v4-flash");
@@ -86,6 +113,22 @@ describe("getCachedModelConfig", () => {
     const config = getCachedModelConfig("dfmodel", "cn");
     expect(config).not.toBeNull();
     expect(config?.is_reasoning).toBe(false);
+  });
+});
+
+describe("formatQoderPriceFactor", () => {
+  it("formats integers and decimals compactly", () => {
+    expect(formatQoderPriceFactor(1)).toBe(" · ×1");
+    expect(formatQoderPriceFactor(0)).toBe(" · ×0");
+    expect(formatQoderPriceFactor(1.6)).toBe(" · ×1.6");
+    expect(formatQoderPriceFactor(0.3)).toBe(" · ×0.3");
+    expect(formatQoderPriceFactor(0.5)).toBe(" · ×0.5");
+    expect(formatQoderPriceFactor(3.2)).toBe(" · ×3.2");
+  });
+
+  it("returns empty string for unknown factors", () => {
+    expect(formatQoderPriceFactor(undefined)).toBe("");
+    expect(formatQoderPriceFactor(Number.NaN)).toBe("");
   });
 });
 
