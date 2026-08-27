@@ -187,6 +187,7 @@ describe("getQoderGlobalDirectModel", () => {
     expect(getQoderGlobalDirectModel("kimi-k3")).toBe("kmodel_latest");
     expect(getQoderGlobalDirectModel("kimi-k2.7-code")).toBe("kmodel");
     expect(getQoderGlobalDirectModel("glm-5.3")).toBe("gmodel");
+    expect(getQoderGlobalDirectModel("glm-5.3-flash")).toBe("gfmodel");
     expect(getQoderGlobalDirectModel("glm-5.2")).toBe("gm51model");
     expect(getQoderGlobalDirectModel("cantus")).toBe("cmodel");
     expect(getQoderGlobalDirectModel("minimax-m3")).toBe("mmodel");
@@ -211,6 +212,8 @@ describe("toQoderGlobalFriendlyModel", () => {
     expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).name).toBe("DeepSeek V4 Pro");
     expect(toQoderGlobalFriendlyModel({ id: "qfmodel", name: "Qwen3.8-Flash" }).id).toBe("qwen3.8-flash");
     expect(toQoderGlobalFriendlyModel({ id: "qfmodel", name: "Qwen3.8-Flash" }).name).toBe("Qwen 3.8 Flash");
+    expect(toQoderGlobalFriendlyModel({ id: "gfmodel", name: "GLM-5.3-Flash" }).id).toBe("glm-5.3-flash");
+    expect(toQoderGlobalFriendlyModel({ id: "gfmodel", name: "GLM-5.3-Flash" }).name).toBe("GLM 5.3 Flash");
   });
 
   it("round-trips friendly id back to internal key", () => {
