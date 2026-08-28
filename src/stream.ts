@@ -35,6 +35,7 @@ import { resolveQoderIdentity } from "./oauth.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
+import { checkQoderQuota } from "./usage.js";
 
 interface ToolCallState {
   arguments: string;
@@ -144,6 +145,19 @@ function delayWithAbort(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Idle timeout (ms) before a stream with no data is declared hung, from
+ * QODER_IDLE_TIMEOUT_MS (default 60000; 0 disables). Guards against the
+ * upstream answering HTTP 200 and then never streaming (e.g. quota exhausted).
+ */
+function parseIdleTimeout(): number {
+  const raw = process.env.QODER_IDLE_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return 60_000;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n) || n < 0) return 60_000;
+  return n;
+}
+
 export function streamQoder(
   model: Model<Api>,
   context: Context,
@@ -191,6 +205,16 @@ export function streamQoder(
       const name = identity.name || (isQoderCNMode(providerMode) ? "Qoder CN User" : "Qoder User");
       const email = identity.email || getQoderUserEmailFallback(providerMode);
       const machineID = identity.machineID || getMachineId();
+
+      // Pre-flight quota check: when the account is out of credits, the
+      // upstream answers the chat endpoint with HTTP 200 but never streams —
+      // the turn would hang with no output. Detect it up front and fail fast
+      // with a friendly message instead. The check is cached for 60s so normal
+      // usage doesn't pay an extra round-trip on every turn.
+      const quotaCheck = await checkQoderQuota(accessToken, providerMode);
+      if (quotaCheck.exhausted) {
+        throw new Error(quotaCheck.message || "Qoder 积分额度已用完，请升级套餐或充值后重试。");
+      }
 
       const qoderModel = isQoderCNMode(providerMode)
         ? getQoderCNDirectModel(model.id)
@@ -263,370 +287,407 @@ export function streamQoder(
       stream.push({ type: "start", partial: output });
 
       const attemptOnce = async (): Promise<void> => {
-        const reqBody: Record<string, unknown> = {
-          request_id: crypto.randomUUID(),
-          request_set_id: recordID,
-          chat_record_id: recordID,
-          session_id: sessionID,
-          stream: true,
-          chat_task: "FREE_INPUT",
-          is_reply: true,
-          is_retry: false,
-          source: 1,
-          version: "3",
-          session_type: "qodercli",
-          agent_id: "agent_common",
-          task_id: "common",
-          code_language: "",
-          chat_prompt: "",
-          image_urls: null,
-          aliyun_user_type: "",
-          // Qoder's server ignores the top-level `system` field; inject the system
-          // prompt as a leading role:system message instead, which it honors.
-          system: "",
-          messages: systemText ? [{ role: "system", content: systemText }, ...normalizedMessages] : normalizedMessages,
-          tools: toolsRaw || [],
-          parameters: {
-            max_tokens: maxTokens,
-            ...(reasoningEffort !== "none" ? { reasoning_effort: reasoningEffort } : { reasoning_effort: "none" }),
-            ...(contextWindow ? { context_window: contextWindow } : {}),
-          },
-          chat_context: {
-            chatPrompt: "",
-            imageUrls: null,
-            extra: {
-              context: [],
-              modelConfig: {
-                key: qoderModel,
-                is_reasoning: isReasoning,
-              },
-              originalContent: lastUserText,
+        // Inner AbortController so both the caller's signal and an idle timeout
+        // (hung upstream, e.g. quota exhausted) can tear the fetch down.
+        const innerController = new AbortController();
+        const onExternalAbort = () => innerController.abort();
+        options?.signal?.addEventListener("abort", onExternalAbort, { once: true });
+        try {
+          const reqBody: Record<string, unknown> = {
+            request_id: crypto.randomUUID(),
+            request_set_id: recordID,
+            chat_record_id: recordID,
+            session_id: sessionID,
+            stream: true,
+            chat_task: "FREE_INPUT",
+            is_reply: true,
+            is_retry: false,
+            source: 1,
+            version: "3",
+            session_type: "qodercli",
+            agent_id: "agent_common",
+            task_id: "common",
+            code_language: "",
+            chat_prompt: "",
+            image_urls: null,
+            aliyun_user_type: "",
+            // Qoder's server ignores the top-level `system` field; inject the system
+            // prompt as a leading role:system message instead, which it honors.
+            system: "",
+            messages: systemText
+              ? [{ role: "system", content: systemText }, ...normalizedMessages]
+              : normalizedMessages,
+            tools: toolsRaw || [],
+            parameters: {
+              max_tokens: maxTokens,
+              ...(reasoningEffort !== "none" ? { reasoning_effort: reasoningEffort } : { reasoning_effort: "none" }),
+              ...(contextWindow ? { context_window: contextWindow } : {}),
             },
-            features: [],
-            text: lastUserText,
-          },
-          model_config: modelConfig,
-          business: {
-            product: "cli",
-            version: "1.0.0",
-            type: "agent",
-            stage: "start",
-            id: crypto.randomUUID(),
-            name: lastUserText.substring(0, 30),
-            begin_at: Date.now(),
-          },
-        };
+            chat_context: {
+              chatPrompt: "",
+              imageUrls: null,
+              extra: {
+                context: [],
+                modelConfig: {
+                  key: qoderModel,
+                  is_reasoning: isReasoning,
+                },
+                originalContent: lastUserText,
+              },
+              features: [],
+              text: lastUserText,
+            },
+            model_config: modelConfig,
+            business: {
+              product: "cli",
+              version: "1.0.0",
+              type: "agent",
+              stage: "start",
+              id: crypto.randomUUID(),
+              name: lastUserText.substring(0, 30),
+              begin_at: Date.now(),
+            },
+          };
 
-        const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-        const encodedBody = qoderEncodeBody(bodyBytes);
-        const encodedBytes = Buffer.from(encodedBody, "utf8");
+          const bodyBytes = Buffer.from(JSON.stringify(reqBody));
+          const encodedBody = qoderEncodeBody(bodyBytes);
+          const encodedBytes = Buffer.from(encodedBody, "utf8");
 
-        const chatURL = getQoderChatURL(providerMode);
+          const chatURL = getQoderChatURL(providerMode);
 
-        const headers = buildAuthHeaders(encodedBytes, chatURL, {
-          userID,
-          authToken: accessToken,
-          name,
-          email,
-          machineID,
-        });
-        logCosyRequest("POST", chatURL, headers);
+          const headers = buildAuthHeaders(encodedBytes, chatURL, {
+            userID,
+            authToken: accessToken,
+            name,
+            email,
+            machineID,
+          });
+          logCosyRequest("POST", chatURL, headers);
 
-        const modelSource = modelConfig.source || "system";
+          const modelSource = modelConfig.source || "system";
 
-        const response = await fetch(chatURL, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "text/event-stream",
-            "Cache-Control": "no-cache",
-            "Accept-Encoding": "identity",
-            "X-Model-Key": qoderModel,
-            "X-Model-Source": modelSource,
-            ...headers,
-          },
-          body: encodedBytes,
-          signal: options?.signal,
-        });
-        await logCosyResponse(chatURL, response);
+          const response = await fetch(chatURL, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: "text/event-stream",
+              "Cache-Control": "no-cache",
+              "Accept-Encoding": "identity",
+              "X-Model-Key": qoderModel,
+              "X-Model-Source": modelSource,
+              ...headers,
+            },
+            body: encodedBytes,
+            signal: innerController.signal,
+          });
+          await logCosyResponse(chatURL, response);
 
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(formatQoderHttpError("api", response.status, response.statusText, errText, chatURL));
-        }
+          if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(formatQoderHttpError("api", response.status, response.statusText, errText, chatURL));
+          }
 
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error("No response body");
-        const decoder = new TextDecoder();
-        let buffer = "";
+          const reader = response.body?.getReader();
+          if (!reader) throw new Error("No response body");
+          const decoder = new TextDecoder();
+          let buffer = "";
+          const idleTimeoutMs = parseIdleTimeout();
 
-        let contentBlockIndex = -1;
-        let thinkingBlockIndex = -1;
-        const toolCallsState: ToolCallState[] = [];
+          let contentBlockIndex = -1;
+          let thinkingBlockIndex = -1;
+          const toolCallsState: ToolCallState[] = [];
 
-        const thinkingEnabled = (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
-        const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
+          const thinkingEnabled =
+            (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
+          const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
 
           while (true) {
-            const lineEnd = buffer.indexOf("\n");
-            if (lineEnd === -1) break;
+            // A stream that delivers nothing for the idle window is hung — the
+            // upstream answered 200 and then went silent (e.g. quota exhausted).
+            // Abort and surface a friendly message instead of spinning forever.
+            if (idleTimeoutMs > 0) {
+              let readTimer: ReturnType<typeof setTimeout> | undefined;
+              const idle = new Promise<never>((_, reject) => {
+                readTimer = setTimeout(() => {
+                  innerController.abort();
+                  reject(
+                    new Error(
+                      "Qoder 模型长时间未返回响应（可能积分已用完或服务繁忙），已中止本次请求。请检查 Qoder 账户额度或稍后重试。",
+                    ),
+                  );
+                }, idleTimeoutMs);
+              });
+              const readPromise = reader.read();
+              // Ignore the late rejection once the idle abort tears the fetch down.
+              readPromise.catch(() => {});
+              const { done, value } = await Promise.race([readPromise, idle]);
+              clearTimeout(readTimer);
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+            } else {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+            }
 
-            const line = buffer.substring(0, lineEnd).trim();
-            buffer = buffer.substring(lineEnd + 1);
+            while (true) {
+              const lineEnd = buffer.indexOf("\n");
+              if (lineEnd === -1) break;
 
-            if (!line.startsWith("data:")) continue;
-            const dataStr = line.substring(5).trim();
-            if (dataStr === "[DONE]") break;
+              const line = buffer.substring(0, lineEnd).trim();
+              buffer = buffer.substring(lineEnd + 1);
 
-            try {
-              const envelope = JSON.parse(dataStr);
-              if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
-                if (process.env.QODER_DEBUG) {
-                  console.error(
-                    "[pi-provider-qoder] upstream error, sent messages:",
-                    JSON.stringify(reqBody.messages, null, 2),
+              if (!line.startsWith("data:")) continue;
+              const dataStr = line.substring(5).trim();
+              if (dataStr === "[DONE]") break;
+
+              try {
+                const envelope = JSON.parse(dataStr);
+                if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+                  if (process.env.QODER_DEBUG) {
+                    console.error(
+                      "[pi-provider-qoder] upstream error, sent messages:",
+                      JSON.stringify(reqBody.messages, null, 2),
+                    );
+                  }
+                  // A 10605 queue payload becomes a typed QoderQueueError so the
+                  // retry loop can auto-wait and re-issue; anything else surfaces
+                  // as a friendly error message.
+                  const queueError = createQoderQueueError(envelope.statusCodeValue, envelope.body, model.name);
+                  throw (
+                    queueError ??
+                    new Error(formatQoderUpstreamError(envelope.statusCodeValue, envelope.body, model.name))
                   );
                 }
-                // A 10605 queue payload becomes a typed QoderQueueError so the
-                // retry loop can auto-wait and re-issue; anything else surfaces
-                // as a friendly error message.
-                const queueError = createQoderQueueError(envelope.statusCodeValue, envelope.body, model.name);
-                throw (
-                  queueError ?? new Error(formatQoderUpstreamError(envelope.statusCodeValue, envelope.body, model.name))
-                );
-              }
 
-              const innerStr = envelope.body;
-              if (!innerStr || innerStr === "[DONE]") continue;
+                const innerStr = envelope.body;
+                if (!innerStr || innerStr === "[DONE]") continue;
 
-              const inner = JSON.parse(innerStr);
-              if (inner.id) output.responseId = inner.id as string;
-              if (inner.model) output.responseModel = inner.model as string;
+                const inner = JSON.parse(innerStr);
+                if (inner.id) output.responseId = inner.id as string;
+                if (inner.model) output.responseModel = inner.model as string;
 
-              if (inner.usage) {
-                const u = inner.usage as {
-                  prompt_tokens?: number;
-                  completion_tokens?: number;
-                  total_tokens?: number;
-                  credits?: number;
-                  original_credits?: number;
-                  completion_tokens_details?: { reasoning_tokens?: number };
-                  prompt_tokens_details?: {
-                    cacheable_tokens?: number;
-                    cached_tokens?: number;
-                    cache_write_tokens?: number;
+                if (inner.usage) {
+                  const u = inner.usage as {
+                    prompt_tokens?: number;
+                    completion_tokens?: number;
+                    total_tokens?: number;
+                    credits?: number;
+                    original_credits?: number;
+                    completion_tokens_details?: { reasoning_tokens?: number };
+                    prompt_tokens_details?: {
+                      cacheable_tokens?: number;
+                      cached_tokens?: number;
+                      cache_write_tokens?: number;
+                    };
                   };
-                };
-                // pi computes promptTokens = input + cacheRead + cacheWrite (Anthropic
-                // convention: input EXCLUDES cached/written tokens). Qoder follows
-                // OpenAI semantics where prompt_tokens INCLUDES cached tokens, so
-                // subtract cacheRead/cacheWrite to match.
-                const promptTokens = u.prompt_tokens ?? 0;
-                const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
-                const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
-                output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
-                output.usage.output = u.completion_tokens ?? 0;
-                output.usage.totalTokens = u.total_tokens ?? 0;
-                output.usage.cacheRead = cacheReadTokens;
-                output.usage.cacheWrite = cacheWriteTokens;
+                  // pi computes promptTokens = input + cacheRead + cacheWrite (Anthropic
+                  // convention: input EXCLUDES cached/written tokens). Qoder follows
+                  // OpenAI semantics where prompt_tokens INCLUDES cached tokens, so
+                  // subtract cacheRead/cacheWrite to match.
+                  const promptTokens = u.prompt_tokens ?? 0;
+                  const cacheReadTokens = u.prompt_tokens_details?.cached_tokens ?? 0;
+                  const cacheWriteTokens = u.prompt_tokens_details?.cache_write_tokens ?? 0;
+                  output.usage.input = Math.max(0, promptTokens - cacheReadTokens - cacheWriteTokens);
+                  output.usage.output = u.completion_tokens ?? 0;
+                  output.usage.totalTokens = u.total_tokens ?? 0;
+                  output.usage.cacheRead = cacheReadTokens;
+                  output.usage.cacheWrite = cacheWriteTokens;
 
-                // Qoder is credit-based: the request's SSE tail reports the credits it
-                // consumed (usage.credits). Fold that into usage.cost so pi's footer
-                // accumulates the session's total credit spend ($x.xxx). Split
-                // input/output by token share so the cost total stays exact while
-                // per-token numbers remain sane for pi's cache-stats.
-                const credits = u.credits ?? 0;
-                if (credits > 0) {
-                  const billedTokens =
-                    output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-                  if (billedTokens > 0) {
-                    const inputShare = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
-                    output.usage.cost.input = (credits * inputShare) / billedTokens;
-                    output.usage.cost.output = (credits * output.usage.output) / billedTokens;
-                  } else {
-                    output.usage.cost.input = credits;
-                  }
-                  output.usage.cost.total = credits;
-                }
-              }
-
-              if (inner.choices && inner.choices.length > 0) {
-                const choice = inner.choices[0];
-                const delta = choice.delta;
-
-                if (delta) {
-                  // 1. Reasoning/thinking content (API reasoning channel)
-                  if (delta.reasoning_content) {
-                    const reasoningChunk = stripThinkingTags(delta.reasoning_content);
-                    if (reasoningChunk) {
-                      if (thinkingBlockIndex === -1) {
-                        thinkingBlockIndex = output.content.length;
-                        output.content.push({ type: "thinking", thinking: "" });
-                        stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
-                      }
-                      const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                      block.thinking += reasoningChunk;
-                      stream.push({
-                        type: "thinking_delta",
-                        contentIndex: thinkingBlockIndex,
-                        delta: reasoningChunk,
-                        partial: output,
-                      });
-                    }
-                  }
-
-                  // 2. Text content
-                  if (delta.content) {
-                    // End API thinking block if active
-                    if (thinkingBlockIndex !== -1) {
-                      const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                      stream.push({
-                        type: "thinking_end",
-                        contentIndex: thinkingBlockIndex,
-                        content: block.thinking,
-                        partial: output,
-                      });
-                      thinkingBlockIndex = -1;
-                    }
-
-                    if (thinkingParser) {
-                      thinkingParser.processChunk(delta.content);
+                  // Qoder is credit-based: the request's SSE tail reports the credits it
+                  // consumed (usage.credits). Fold that into usage.cost so pi's footer
+                  // accumulates the session's total credit spend ($x.xxx). Split
+                  // input/output by token share so the cost total stays exact while
+                  // per-token numbers remain sane for pi's cache-stats.
+                  const credits = u.credits ?? 0;
+                  if (credits > 0) {
+                    const billedTokens =
+                      output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
+                    if (billedTokens > 0) {
+                      const inputShare = output.usage.input + output.usage.cacheRead + output.usage.cacheWrite;
+                      output.usage.cost.input = (credits * inputShare) / billedTokens;
+                      output.usage.cost.output = (credits * output.usage.output) / billedTokens;
                     } else {
-                      if (contentBlockIndex === -1) {
-                        contentBlockIndex = output.content.length;
-                        output.content.push({ type: "text", text: "" });
-                        stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-                      }
-                      const block = output.content[contentBlockIndex] as TextContent;
-                      block.text += delta.content;
-                      stream.push({
-                        type: "text_delta",
-                        contentIndex: contentBlockIndex,
-                        delta: delta.content,
-                        partial: output,
-                      });
+                      output.usage.cost.input = credits;
                     }
+                    output.usage.cost.total = credits;
                   }
+                }
 
-                  // 3. Tool calls
-                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                    for (const tc of delta.tool_calls) {
-                      const idx = tc.index ?? 0;
-                      if (!toolCallsState[idx]) {
-                        toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
-                      }
-                      const state = toolCallsState[idx];
-                      if (tc.id) state.id = tc.id;
-                      if (tc.function?.name) state.name = tc.function.name;
+                if (inner.choices && inner.choices.length > 0) {
+                  const choice = inner.choices[0];
+                  const delta = choice.delta;
 
-                      // Open the block as soon as the call is IDENTIFIABLE, not when
-                      // its first argument byte arrives. A no-argument tool used to
-                      // create no content block, making the finalizer claim "toolUse"
-                      // on a message carrying no tool call, dead-ending the turn.
-                      if (state.emittedStart === undefined && (state.id || state.name)) {
-                        state.emittedStart = true;
-                        state.contentIndex = output.content.length;
-                        output.content.push({
-                          type: "toolCall",
-                          id: state.id,
-                          name: state.name,
-                          arguments: {},
-                        } satisfies ToolCall);
-                        stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
-                      }
-
-                      // id/name can arrive after the block is open; keep it in step.
-                      if (state.emittedStart) {
-                        const block = output.content[state.contentIndex] as ToolCall;
-                        block.id = state.id;
-                        block.name = state.name;
-                      }
-
-                      if (tc.function?.arguments) {
-                        const argDelta = tc.function.arguments;
-                        state.arguments += argDelta;
+                  if (delta) {
+                    // 1. Reasoning/thinking content (API reasoning channel)
+                    if (delta.reasoning_content) {
+                      const reasoningChunk = stripThinkingTags(delta.reasoning_content);
+                      if (reasoningChunk) {
+                        if (thinkingBlockIndex === -1) {
+                          thinkingBlockIndex = output.content.length;
+                          output.content.push({ type: "thinking", thinking: "" });
+                          stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
+                        }
+                        const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                        block.thinking += reasoningChunk;
                         stream.push({
-                          type: "toolcall_delta",
-                          contentIndex: state.contentIndex,
-                          delta: argDelta,
+                          type: "thinking_delta",
+                          contentIndex: thinkingBlockIndex,
+                          delta: reasoningChunk,
                           partial: output,
                         });
                       }
                     }
+
+                    // 2. Text content
+                    if (delta.content) {
+                      // End API thinking block if active
+                      if (thinkingBlockIndex !== -1) {
+                        const block = output.content[thinkingBlockIndex] as ThinkingContent;
+                        stream.push({
+                          type: "thinking_end",
+                          contentIndex: thinkingBlockIndex,
+                          content: block.thinking,
+                          partial: output,
+                        });
+                        thinkingBlockIndex = -1;
+                      }
+
+                      if (thinkingParser) {
+                        thinkingParser.processChunk(delta.content);
+                      } else {
+                        if (contentBlockIndex === -1) {
+                          contentBlockIndex = output.content.length;
+                          output.content.push({ type: "text", text: "" });
+                          stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+                        }
+                        const block = output.content[contentBlockIndex] as TextContent;
+                        block.text += delta.content;
+                        stream.push({
+                          type: "text_delta",
+                          contentIndex: contentBlockIndex,
+                          delta: delta.content,
+                          partial: output,
+                        });
+                      }
+                    }
+
+                    // 3. Tool calls
+                    if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                      for (const tc of delta.tool_calls) {
+                        const idx = tc.index ?? 0;
+                        if (!toolCallsState[idx]) {
+                          toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
+                        }
+                        const state = toolCallsState[idx];
+                        if (tc.id) state.id = tc.id;
+                        if (tc.function?.name) state.name = tc.function.name;
+
+                        // Open the block as soon as the call is IDENTIFIABLE, not when
+                        // its first argument byte arrives. A no-argument tool used to
+                        // create no content block, making the finalizer claim "toolUse"
+                        // on a message carrying no tool call, dead-ending the turn.
+                        if (state.emittedStart === undefined && (state.id || state.name)) {
+                          state.emittedStart = true;
+                          state.contentIndex = output.content.length;
+                          output.content.push({
+                            type: "toolCall",
+                            id: state.id,
+                            name: state.name,
+                            arguments: {},
+                          } satisfies ToolCall);
+                          stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
+                        }
+
+                        // id/name can arrive after the block is open; keep it in step.
+                        if (state.emittedStart) {
+                          const block = output.content[state.contentIndex] as ToolCall;
+                          block.id = state.id;
+                          block.name = state.name;
+                        }
+
+                        if (tc.function?.arguments) {
+                          const argDelta = tc.function.arguments;
+                          state.arguments += argDelta;
+                          stream.push({
+                            type: "toolcall_delta",
+                            contentIndex: state.contentIndex,
+                            delta: argDelta,
+                            partial: output,
+                          });
+                        }
+                      }
+                    }
+                  }
+
+                  if (choice.finish_reason) {
+                    // Preserve the real upstream finish_reason instead of forcing "stop".
+                    output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
                   }
                 }
-
-                if (choice.finish_reason) {
-                  // Preserve the real upstream finish_reason instead of forcing "stop".
-                  output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
+              } catch (e) {
+                // A single malformed SSE line shouldn't kill the stream — skip it.
+                // But a genuine upstream error must propagate to the outer catch.
+                if (e instanceof SyntaxError) {
+                  if (process.env.QODER_DEBUG) {
+                    console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
+                  }
+                  continue;
                 }
+                throw e;
               }
-            } catch (e) {
-              // A single malformed SSE line shouldn't kill the stream — skip it.
-              // But a genuine upstream error must propagate to the outer catch.
-              if (e instanceof SyntaxError) {
-                if (process.env.QODER_DEBUG) {
-                  console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
-                }
-                continue;
-              }
-              throw e;
             }
           }
-        }
 
-        if (thinkingParser) thinkingParser.finalize();
+          if (thinkingParser) thinkingParser.finalize();
 
-        if (thinkingBlockIndex !== -1) {
-          const block = output.content[thinkingBlockIndex] as ThinkingContent;
-          stream.push({
-            type: "thinking_end",
-            contentIndex: thinkingBlockIndex,
-            content: block.thinking,
-            partial: output,
-          });
-        }
-
-        for (const state of toolCallsState) {
-          if (state?.emittedStart && !state.emittedEnd) {
-            state.emittedEnd = true;
-            let args = {};
-            try {
-              args = JSON.parse(state.arguments || "{}");
-            } catch {}
-            const block = output.content[state.contentIndex] as ToolCall;
-            block.arguments = args;
+          if (thinkingBlockIndex !== -1) {
+            const block = output.content[thinkingBlockIndex] as ThinkingContent;
             stream.push({
-              type: "toolcall_end",
-              contentIndex: state.contentIndex,
-              toolCall: {
-                type: "toolCall",
-                id: state.id,
-                name: state.name,
-                arguments: args,
-              },
+              type: "thinking_end",
+              contentIndex: thinkingBlockIndex,
+              content: block.thinking,
               partial: output,
             });
           }
-        }
 
-        // Guard on blocks that actually reached the message, not on the state array.
-        if (toolCallsState.some((state) => state?.emittedStart)) {
-          output.stopReason = "toolUse";
-        }
+          for (const state of toolCallsState) {
+            if (state?.emittedStart && !state.emittedEnd) {
+              state.emittedEnd = true;
+              let args = {};
+              try {
+                args = JSON.parse(state.arguments || "{}");
+              } catch {}
+              const block = output.content[state.contentIndex] as ToolCall;
+              block.arguments = args;
+              stream.push({
+                type: "toolcall_end",
+                contentIndex: state.contentIndex,
+                toolCall: {
+                  type: "toolCall",
+                  id: state.id,
+                  name: state.name,
+                  arguments: args,
+                },
+                partial: output,
+              });
+            }
+          }
 
-        stream.push({
-          type: "done",
-          reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
-          message: output,
-        });
-        stream.end();
+          // Guard on blocks that actually reached the message, not on the state array.
+          if (toolCallsState.some((state) => state?.emittedStart)) {
+            output.stopReason = "toolUse";
+          }
+
+          stream.push({
+            type: "done",
+            reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
+            message: output,
+          });
+          stream.end();
+        } finally {
+          options?.signal?.removeEventListener("abort", onExternalAbort);
+        }
       };
 
       // Retry loop: on a QoderQueueError, surface a live notice, wait the

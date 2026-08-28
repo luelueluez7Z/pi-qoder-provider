@@ -15,6 +15,7 @@ interface QoderUsageInfo {
   totalUsagePercentage: number;
   isQuotaExceeded: boolean;
   expiresAt: number;
+  upgradeUrl?: string;
 }
 
 export interface QoderProviderUsage {
@@ -90,4 +91,79 @@ export async function fetchQoderUsage(credentials: OAuthCredentials): Promise<Qo
 
 export async function fetchQoderUsageCN(credentials: OAuthCredentials): Promise<QoderProviderUsage> {
   return fetchQoderUsageForMode(credentials, "cn");
+}
+
+// ---------------------------------------------------------------------------
+// Pre-flight quota guard
+//
+// When the account has no credits left, the upstream answers the chat endpoint
+// with HTTP 200 but never streams anything — the turn would hang forever with
+// no error. Check the quota endpoint up front and fail fast with a friendly
+// message instead.
+// ---------------------------------------------------------------------------
+
+let quotaCheckCache: { at: number; mode: string; exhausted: boolean } | null = null;
+
+export interface QoderQuotaCheck {
+  exhausted: boolean;
+  message?: string;
+}
+
+function formatQuotaExhaustedMessage(raw: QoderUsageInfo, mode: string): string {
+  const user = raw.userQuota;
+  const org = raw.orgResourcePackage;
+  const userPart = user && user.remaining <= 0 ? `个人额度已用尽（${user.used}/${user.total} ${user.unit}）` : "";
+  const orgPart = org && org.remaining <= 0 ? "组织额度已用尽" : "";
+  const details = [userPart, orgPart].filter(Boolean).join("，");
+  const resetAt = raw.expiresAt ? new Date(raw.expiresAt).toLocaleString() : undefined;
+  const resetPart = resetAt ? `额度将于 ${resetAt} 重置` : "";
+  const upgradeUrl = raw.upgradeUrl || getQoderManageUrl(mode);
+  const parts = ["Qoder 积分额度已用完", details, resetPart].filter(Boolean);
+  return `${parts.join("：")}。请前往 ${upgradeUrl} 升级套餐或充值后重试。`;
+}
+
+/**
+ * Pre-flight quota check before a chat request. Returns `exhausted: true` with
+ * a friendly message when neither the user quota nor the org resource package
+ * has credits left.
+ *
+ * A non-exhausted result is cached for 60s so normal usage does not pay the
+ * extra round-trip on every turn; an exhausted result is never cached, so a
+ * recharge takes effect on the very next request. Any check failure is treated
+ * as "not exhausted" — the check must never block a chat request.
+ */
+export async function checkQoderQuota(access: string, mode: string): Promise<QoderQuotaCheck> {
+  if (
+    quotaCheckCache &&
+    quotaCheckCache.mode === mode &&
+    !quotaCheckCache.exhausted &&
+    Date.now() - quotaCheckCache.at < 60_000
+  ) {
+    return { exhausted: false };
+  }
+  try {
+    const response = await fetch(getQoderUsageURL(mode), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${access}`,
+        Accept: "application/json",
+        "User-Agent": "pi-provider-qoder",
+      },
+    });
+    if (!response.ok) return { exhausted: false };
+    const raw = (await response.json()) as QoderUsageInfo;
+    const userRemaining = raw.userQuota?.remaining ?? 0;
+    const orgRemaining = raw.orgResourcePackage?.remaining ?? 0;
+    const exhausted = raw.isQuotaExceeded === true || (userRemaining <= 0 && orgRemaining <= 0);
+    quotaCheckCache = { at: Date.now(), mode, exhausted };
+    if (!exhausted) return { exhausted: false };
+    return { exhausted: true, message: formatQuotaExhaustedMessage(raw, mode) };
+  } catch {
+    return { exhausted: false };
+  }
+}
+
+/** Test helper: clear the pre-flight quota cache. */
+export function resetQoderQuotaCache(): void {
+  quotaCheckCache = null;
 }

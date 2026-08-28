@@ -86,6 +86,14 @@ When the model gateway reports that a model is queued (error code `10605`), the 
 export QODER_QUEUE_RETRY_MAX=3   # max automatic retries after a queue response (default 3; 0 disables)
 ```
 
+### Quota guard
+
+When the account runs out of credits, the upstream answers the chat endpoint with HTTP 200 but never streams anything — the turn would hang with no output. The provider checks the quota endpoint before each request (cached for 60s) and fails fast with a friendly "额度已用完" message. As a fallback, a stream that delivers nothing for the idle window is aborted and reported:
+
+```bash
+export QODER_IDLE_TIMEOUT_MS=60000   # abort a stream with no data after N ms (default 60000; 0 disables)
+```
+
 ## Endpoints
 
 Global:

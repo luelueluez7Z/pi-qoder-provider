@@ -9,6 +9,18 @@ import type {
 } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamQoder } from "../stream.js";
+import { resetQoderQuotaCache } from "../usage.js";
+
+// A quota endpoint response that reports credits remaining (not exhausted).
+const QUOTA_OK_JSON = JSON.stringify({
+  isQuotaExceeded: false,
+  userQuota: { total: 100, used: 10, remaining: 90, percentage: 0.1, unit: "credits" },
+  orgResourcePackage: { total: 100, used: 0, remaining: 100, percentage: 0, unit: "credits" },
+});
+
+function jsonResponse(body: string): Response {
+  return new Response(body, { status: 200, headers: { "content-type": "application/json" } });
+}
 
 /** Build a single SSE `data:` line carrying a Qoder envelope. */
 function sseEnvelope(body: object, statusCodeValue = 200, statusCode = "OK"): string {
@@ -101,10 +113,10 @@ function mockFetch(body: string): typeof fetch {
     // resolveQoderIdentity calls /userinfo first (when auth.json is missing);
     // return a valid identity so the chat request proceeds.
     if (url.includes("/userinfo")) {
-      return new Response(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return jsonResponse(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }));
+    }
+    if (url.includes("/quota/usage")) {
+      return jsonResponse(QUOTA_OK_JSON);
     }
     return response;
   }) as unknown as typeof fetch;
@@ -116,10 +128,10 @@ function sequenceFetch(bodies: string[]): typeof fetch {
   return vi.fn(async (input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     if (url.includes("/userinfo")) {
-      return new Response(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
+      return jsonResponse(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }));
+    }
+    if (url.includes("/quota/usage")) {
+      return jsonResponse(QUOTA_OK_JSON);
     }
     const body = bodies[Math.min(call, bodies.length - 1)];
     call += 1;
@@ -128,7 +140,10 @@ function sequenceFetch(bodies: string[]): typeof fetch {
 }
 
 function chatFetchCalls(fetchMock: ReturnType<typeof vi.fn>): number {
-  return fetchMock.mock.calls.filter((c) => !String(c[0]).includes("/userinfo")).length;
+  return fetchMock.mock.calls.filter((c) => {
+    const url = String(c[0]);
+    return !url.includes("/userinfo") && !url.includes("/quota/usage");
+  }).length;
 }
 
 function makeModel(): Model<Api> {
@@ -157,6 +172,8 @@ describe("streamQoder", () => {
   afterEach(() => {
     globalThis.fetch = originalFetch;
     delete process.env.QODER_QUEUE_RETRY_MAX;
+    delete process.env.QODER_IDLE_TIMEOUT_MS;
+    resetQoderQuotaCache();
     vi.restoreAllMocks();
   });
 
@@ -403,5 +420,66 @@ describe("streamQoder", () => {
     const err = events.find((e) => e.type === "error");
     expect(err, "expected an error event when auto-retry is disabled").toBeDefined();
     expect(chatFetchCalls(globalThis.fetch as ReturnType<typeof vi.fn>)).toBe(1);
+  });
+
+  it("fails fast with a friendly message when the quota is exhausted", async () => {
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/userinfo")) {
+        return jsonResponse(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }));
+      }
+      if (url.includes("/quota/usage")) {
+        return jsonResponse(
+          JSON.stringify({
+            isQuotaExceeded: true,
+            userQuota: { total: 3000, used: 3000, remaining: 0, percentage: 1, unit: "credits" },
+            orgResourcePackage: { total: 100, used: 100, remaining: 0, percentage: 1, unit: "credits" },
+            upgradeUrl: "https://qoder.com/pricing",
+          }),
+        );
+      }
+      throw new Error("chat endpoint must not be called when the quota is exhausted");
+    }) as unknown as typeof fetch;
+
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event when the quota is exhausted").toBeDefined();
+    const msg = (err as { error: AssistantMessage }).error;
+    expect(msg.stopReason).toBe("error");
+    expect(msg.errorMessage).toMatch(/额度已用完/);
+    // The chat request must never be issued; only userinfo + quota checks ran.
+    expect(chatFetchCalls(globalThis.fetch as ReturnType<typeof vi.fn>)).toBe(0);
+  });
+
+  it("aborts a hung stream after the idle timeout with a friendly message", async () => {
+    process.env.QODER_IDLE_TIMEOUT_MS = "100";
+    // The chat endpoint answers HTTP 200 but its body never delivers a byte
+    // (the upstream behaviour when the quota is exhausted).
+    const hanging = new ReadableStream({
+      start(controller) {
+        // Never enqueue or close — the stream just hangs.
+        void controller;
+      },
+    });
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/userinfo")) {
+        return jsonResponse(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }));
+      }
+      if (url.includes("/quota/usage")) {
+        return jsonResponse(QUOTA_OK_JSON);
+      }
+      return new Response(hanging, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as unknown as typeof fetch;
+
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event after the idle timeout").toBeDefined();
+    const msg = (err as { error: AssistantMessage }).error;
+    expect(msg.errorMessage).toMatch(/长时间未返回响应/);
   });
 });
