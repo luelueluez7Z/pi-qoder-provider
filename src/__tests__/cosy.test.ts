@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createQoderQueueError,
   formatQoderUpstreamError,
   getQoderBaseUrl,
   getQoderCenterUrl,
@@ -16,6 +17,7 @@ import {
   getQoderUserEmailFallback,
   getQoderUserInfoURL,
   parseQoderUpstreamError,
+  QoderQueueError,
   toQoderCNFriendlyModel,
   toQoderGlobalFriendlyModel,
 } from "../cosy.js";
@@ -329,5 +331,44 @@ describe("formatQoderUpstreamError", () => {
   it("falls back to raw body for unknown codes", () => {
     const msg = formatQoderUpstreamError(500, JSON.stringify({ code: "99999", message: "boom" }));
     expect(msg).toContain("boom");
+  });
+});
+
+describe("createQoderQueueError", () => {
+  const queuedBody = JSON.stringify({
+    code: "403",
+    message: JSON.stringify({
+      code: "10605",
+      message: JSON.stringify({
+        isQueued: true,
+        modelKey: "kmodel_latest",
+        queueCount: 1033,
+        queueType: "slow",
+        retryAfterSeconds: 30,
+        serviceAvailable: true,
+        waitTime: 316,
+      }),
+    }),
+  });
+
+  it("builds a typed QoderQueueError from a 10605 queue payload", () => {
+    const err = createQoderQueueError(403, queuedBody, "Kimi K3");
+    expect(err).toBeInstanceOf(QoderQueueError);
+    expect(err?.queue.retryAfterSeconds).toBe(30);
+    expect(err?.queue.queueCount).toBe(1033);
+    expect(err?.message).toContain("Kimi K3");
+    expect(err?.message).toContain("正在排队");
+  });
+
+  it("returns null for non-queue upstream errors", () => {
+    const err = createQoderQueueError(
+      403,
+      JSON.stringify({ code: "403", message: JSON.stringify({ code: "429", message: "busy" }) }),
+    );
+    expect(err).toBeNull();
+  });
+
+  it("returns null for non-JSON bodies", () => {
+    expect(createQoderQueueError(500, "not json")).toBeNull();
   });
 });

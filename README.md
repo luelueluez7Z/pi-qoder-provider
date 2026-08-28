@@ -78,6 +78,14 @@ export QODER_REGION=cn       # or QODER_BACKEND=cn / QODER_MODE=cn
 
 Setting a CN PAT without a global PAT also auto-selects CN mode for the `qoder` entry, but the recommended explicit China entry is `/login qoder-cn` / `--provider qoder-cn`.
 
+### Queue auto-retry
+
+When the model gateway reports that a model is queued (error code `10605`), the provider waits the server-suggested duration and automatically re-issues the same request instead of failing the turn. A short notice is shown in the reply while retrying; if the queue never clears, the friendly queue error is surfaced.
+
+```bash
+export QODER_QUEUE_RETRY_MAX=3   # max automatic retries after a queue response (default 3; 0 disables)
+```
+
 ## Endpoints
 
 Global:

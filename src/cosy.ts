@@ -665,18 +665,47 @@ export function formatQoderUpstreamError(status: number, body: string, modelName
   if (!info) return `Upstream status ${status}: ${body}`;
 
   if (info.code === "10605" && info.queue) {
-    const q = info.queue;
-    const waitSec = typeof q.retryAfterSeconds === "number" ? q.retryAfterSeconds : 30;
-    const queueCount = typeof q.queueCount === "number" && q.queueCount > 0 ? q.queueCount : undefined;
-    const model = modelName || (q.modelKey ? q.modelKey : "当前模型");
-    const queuePart = queueCount !== undefined ? `（队列中约 ${queueCount} 个请求）` : "";
-    return (
-      `${model} 当前正在排队${queuePart}，暂时无法响应，预计等待约 ${waitSec} 秒。` +
-      `请稍后重试，或切换到其他模型（如 DeepSeek V4 Pro / Flash）。`
-    );
+    return formatQoderQueueMessage(info.queue, modelName);
   }
 
   const hint = QODER_ERROR_HINTS[info.code];
   if (hint) return `${hint}（错误码 ${info.code}）`;
   return `Qoder 上游返回错误（HTTP ${status}${info.code ? `，错误码 ${info.code}` : ""}）: ${info.message || body}`;
+}
+
+/** Human-readable message for a 10605 queue payload (shared by the error formatter and QoderQueueError). */
+function formatQoderQueueMessage(queue: QoderQueueInfo, modelName?: string): string {
+  const waitSec = typeof queue.retryAfterSeconds === "number" ? queue.retryAfterSeconds : 30;
+  const queueCount = typeof queue.queueCount === "number" && queue.queueCount > 0 ? queue.queueCount : undefined;
+  const model = modelName || (queue.modelKey ? queue.modelKey : "当前模型");
+  const queuePart = queueCount !== undefined ? `（队列中约 ${queueCount} 个请求）` : "";
+  return (
+    `${model} 当前正在排队${queuePart}，暂时无法响应，预计等待约 ${waitSec} 秒。` +
+    `请稍后重试，或切换到其他模型（如 DeepSeek V4 Pro / Flash）。`
+  );
+}
+
+/**
+ * Typed error for a 10605 "model queued" response. stream.ts catches this to
+ * auto-wait the server-suggested duration and re-issue the same request.
+ */
+export class QoderQueueError extends Error {
+  readonly status: number;
+  readonly queue: QoderQueueInfo;
+  readonly modelName?: string;
+
+  constructor(status: number, queue: QoderQueueInfo, modelName?: string) {
+    super(formatQoderQueueMessage(queue, modelName));
+    this.name = "QoderQueueError";
+    this.status = status;
+    this.queue = queue;
+    this.modelName = modelName;
+  }
+}
+
+/** Build a QoderQueueError when `body` carries the 10605 queue payload, else null. */
+export function createQoderQueueError(status: number, body: string, modelName?: string): QoderQueueError | null {
+  const info = parseQoderUpstreamError(body);
+  if (info?.code === "10605" && info.queue) return new QoderQueueError(status, info.queue, modelName);
+  return null;
 }

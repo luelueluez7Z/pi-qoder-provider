@@ -70,6 +70,27 @@ const BLOCKED_SSE = sseEnvelope(
   "Not Acceptable",
 );
 
+// A 10605 "model queued" payload, wrapped in the nested upstream envelope.
+const QUEUED_SSE = sseEnvelope(
+  {
+    code: "403",
+    message: JSON.stringify({
+      code: "10605",
+      message: JSON.stringify({
+        isQueued: true,
+        modelKey: "ultimate",
+        queueCount: 1033,
+        queueType: "slow",
+        retryAfterSeconds: 0,
+        serviceAvailable: true,
+        waitTime: 0,
+      }),
+    }),
+  },
+  403,
+  "Forbidden",
+);
+
 function mockFetch(body: string): typeof fetch {
   const response = new Response(body, {
     status: 200,
@@ -87,6 +108,27 @@ function mockFetch(body: string): typeof fetch {
     }
     return response;
   }) as unknown as typeof fetch;
+}
+
+/** Return a fresh Response per call, so each chat attempt gets its own body. */
+function sequenceFetch(bodies: string[]): typeof fetch {
+  let call = 0;
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes("/userinfo")) {
+      return new Response(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const body = bodies[Math.min(call, bodies.length - 1)];
+    call += 1;
+    return new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }) as unknown as typeof fetch;
+}
+
+function chatFetchCalls(fetchMock: ReturnType<typeof vi.fn>): number {
+  return fetchMock.mock.calls.filter((c) => !String(c[0]).includes("/userinfo")).length;
 }
 
 function makeModel(): Model<Api> {
@@ -114,6 +156,7 @@ describe("streamQoder", () => {
   const originalFetch = globalThis.fetch;
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    delete process.env.QODER_QUEUE_RETRY_MAX;
     vi.restoreAllMocks();
   });
 
@@ -317,5 +360,48 @@ describe("streamQoder", () => {
     const msg = (done as { message: AssistantMessage }).message;
     expect(msg.content.find((c) => c.type === "toolCall")).toBeUndefined();
     expect(msg.stopReason).toBe("stop");
+  });
+
+  it("auto-retries after a 10605 queue response and then succeeds", async () => {
+    globalThis.fetch = sequenceFetch([QUEUED_SSE, SUCCESS_SSE]);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const done = events.find((e) => e.type === "done");
+    expect(done, "expected a done event after the queue retry").toBeDefined();
+    const msg = (done as { message: AssistantMessage }).message;
+    expect(msg.stopReason).toBe("stop");
+    // The live queue notice is a leading text block; the real reply follows it.
+    const texts = msg.content.filter((c) => c.type === "text").map((c) => (c as { text: string }).text);
+    expect(texts[0]).toContain("排队中");
+    expect(texts[1]).toBe("OK");
+    // userinfo once + queued chat attempt + successful chat attempt.
+    expect(chatFetchCalls(globalThis.fetch as ReturnType<typeof vi.fn>)).toBe(2);
+  });
+
+  it("surfaces the friendly queue error when retries are exhausted", async () => {
+    process.env.QODER_QUEUE_RETRY_MAX = "1";
+    globalThis.fetch = sequenceFetch([QUEUED_SSE, QUEUED_SSE, QUEUED_SSE]);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event after the queue retries run out").toBeDefined();
+    const msg = (err as { error: AssistantMessage }).error;
+    expect(msg.stopReason).toBe("error");
+    expect(msg.errorMessage).toMatch(/正在排队/);
+    // One initial attempt + one retry.
+    expect(chatFetchCalls(globalThis.fetch as ReturnType<typeof vi.fn>)).toBe(2);
+  });
+
+  it("does not auto-retry when QODER_QUEUE_RETRY_MAX=0", async () => {
+    process.env.QODER_QUEUE_RETRY_MAX = "0";
+    globalThis.fetch = sequenceFetch([QUEUED_SSE, SUCCESS_SSE]);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((e) => e.type === "error");
+    expect(err, "expected an error event when auto-retry is disabled").toBeDefined();
+    expect(chatFetchCalls(globalThis.fetch as ReturnType<typeof vi.fn>)).toBe(1);
   });
 });
