@@ -4,7 +4,7 @@ import { qoderEncodeBody } from "../qoder-encoding.js";
 describe("qoderEncodeBody", () => {
   it("encodes a simple string", () => {
     const result = qoderEncodeBody("hello");
-    expect(result).toBeTruthy();
+    expect(result).toBe("q$FruHPH");
     expect(typeof result).toBe("string");
     expect(result).not.toContain("=");
   });

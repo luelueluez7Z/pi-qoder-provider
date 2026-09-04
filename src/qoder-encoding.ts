@@ -14,19 +14,18 @@ const STD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012345
 export function qoderEncodeBody(plaintext: string | Buffer): string {
   const std = Buffer.isBuffer(plaintext) ? plaintext.toString("base64") : Buffer.from(plaintext).toString("base64");
   const n = std.length;
+  if (n === 0) return "";
   const a = Math.floor(n / 3);
-  const rearranged = std.slice(n - a) + std.slice(a, n - a) + std.slice(0, a);
-
-  let out = "";
+  const out = Buffer.allocUnsafe(n);
   for (let i = 0; i < n; i++) {
-    const c = rearranged[i];
+    const sourceIndex = i < a ? n - a + i : i < n - a ? i : i - (n - a);
+    const c = std[sourceIndex];
     if (c === "=") {
-      out += "$";
+      out[i] = 36;
     } else {
       const idx = STD_ALPHABET.indexOf(c);
-      if (idx >= 0) out += CUSTOM_ALPHABET[idx];
-      else out += c;
+      out[i] = idx >= 0 ? CUSTOM_ALPHABET.charCodeAt(idx) : c.charCodeAt(0);
     }
   }
-  return out;
+  return out.toString("ascii");
 }

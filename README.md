@@ -94,6 +94,15 @@ When the account runs out of credits, the upstream answers the chat endpoint wit
 export QODER_IDLE_TIMEOUT_MS=60000   # abort a stream with no data after N ms (default 60000; 0 disables)
 ```
 
+### Network safety
+
+All Qoder control requests and chat connection setup have an abortable timeout. A chat stream also has a total lifetime limit. Malformed SSE, premature EOF, and invalid tool arguments are reported as errors so pi can apply its bounded retry policy instead of treating a partial reply as successful:
+
+```bash
+export QODER_HTTP_TIMEOUT_MS=60000    # control requests and chat connection (default 60000; 0 disables)
+export QODER_STREAM_TIMEOUT_MS=300000 # total open chat stream lifetime (default 300000; 0 disables)
+```
+
 ## Endpoints
 
 Global:

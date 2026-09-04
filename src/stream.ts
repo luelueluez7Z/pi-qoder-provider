@@ -30,6 +30,7 @@ import {
   logCosyResponse,
   QoderQueueError,
 } from "./cosy.js";
+import { withQoderHttpTimeout } from "./http.js";
 import { getCachedModelConfig } from "./models.js";
 import { resolveQoderIdentity } from "./oauth.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
@@ -158,6 +159,23 @@ function parseIdleTimeout(): number {
   return n;
 }
 
+function parseStreamTimeout(): number {
+  const raw = process.env.QODER_STREAM_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return 5 * 60_000;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n) || n < 0) return 5 * 60_000;
+  return n;
+}
+
+const MAX_SSE_BUFFER_CHARS = 8 * 1024 * 1024;
+const MAX_TOOL_ARGUMENT_CHARS = 1 * 1024 * 1024;
+const MAX_TOOL_CALLS = 128;
+const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 export function streamQoder(
   model: Model<Api>,
   context: Context,
@@ -200,7 +218,7 @@ export function streamQoder(
       // Resolve identity: auth.json fast path → in-process cache → /userinfo(access).
       // Cold start only has options.apiKey (access); do NOT decode refresh here.
       // Never invent a placeholder userID — the gateway returns opaque HTTP 500.
-      const identity = await resolveQoderIdentity(accessToken, model.provider, providerMode);
+      const identity = await resolveQoderIdentity(accessToken, model.provider, providerMode, options?.signal);
       const userID = identity.userID;
       const name = identity.name || (isQoderCNMode(providerMode) ? "Qoder CN User" : "Qoder User");
       const email = identity.email || getQoderUserEmailFallback(providerMode);
@@ -211,7 +229,7 @@ export function streamQoder(
       // the turn would hang with no output. Detect it up front and fail fast
       // with a friendly message instead. The check is cached for 60s so normal
       // usage doesn't pay an extra round-trip on every turn.
-      const quotaCheck = await checkQoderQuota(accessToken, providerMode);
+      const quotaCheck = await checkQoderQuota(accessToken, providerMode, options?.signal);
       if (quotaCheck.exhausted) {
         throw new Error(quotaCheck.message || "Qoder 积分额度已用完，请升级套餐或充值后重试。");
       }
@@ -290,10 +308,16 @@ export function streamQoder(
         // Inner AbortController so both the caller's signal and an idle timeout
         // (hung upstream, e.g. quota exhausted) can tear the fetch down.
         const innerController = new AbortController();
-        const onExternalAbort = () => innerController.abort();
         let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+        const onExternalAbort = () => {
+          innerController.abort();
+          void reader?.cancel().catch(() => {});
+        };
+        let streamTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
+        let streamTimedOut = false;
         options?.signal?.addEventListener("abort", onExternalAbort, { once: true });
         try {
+          if (options?.signal?.aborted) throw new Error("aborted");
           const reqBody: Record<string, unknown> = {
             request_id: crypto.randomUUID(),
             request_set_id: recordID,
@@ -350,7 +374,11 @@ export function streamQoder(
             },
           };
 
+          if (options?.signal?.aborted) throw new Error("aborted");
           const bodyBytes = Buffer.from(JSON.stringify(reqBody));
+          if (bodyBytes.byteLength > MAX_REQUEST_BODY_BYTES) {
+            throw new Error(`Qoder request body exceeded ${MAX_REQUEST_BODY_BYTES} bytes`);
+          }
           const encodedBody = qoderEncodeBody(bodyBytes);
           const encodedBytes = Buffer.from(encodedBody, "utf8");
 
@@ -367,32 +395,47 @@ export function streamQoder(
 
           const modelSource = modelConfig.source || "system";
 
-          const response = await fetch(chatURL, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Accept: "text/event-stream",
-              "Cache-Control": "no-cache",
-              "Accept-Encoding": "identity",
-              "X-Model-Key": qoderModel,
-              "X-Model-Source": modelSource,
-              ...headers,
-            },
-            body: encodedBytes,
-            signal: innerController.signal,
-          });
-          await logCosyResponse(chatURL, response);
+          const response = await withQoderHttpTimeout("chat connection", innerController.signal, (signal) =>
+            fetch(chatURL, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Accept-Encoding": "identity",
+                "X-Model-Key": qoderModel,
+                "X-Model-Source": modelSource,
+                ...headers,
+              },
+              body: encodedBytes,
+              signal,
+            }),
+          );
+          await withQoderHttpTimeout("chat response logging", innerController.signal, () =>
+            logCosyResponse(chatURL, response),
+          );
 
           if (!response.ok) {
-            const errText = await response.text();
+            const errText = await withQoderHttpTimeout("chat error body", innerController.signal, () =>
+              response.text(),
+            );
             throw new Error(formatQoderHttpError("api", response.status, response.statusText, errText, chatURL));
           }
 
           reader = response.body?.getReader();
           if (!reader) throw new Error("No response body");
+          const streamTimeoutMs = parseStreamTimeout();
+          if (streamTimeoutMs > 0) {
+            streamTimeoutTimer = setTimeout(() => {
+              streamTimedOut = true;
+              innerController.abort();
+              void reader?.cancel().catch(() => {});
+            }, streamTimeoutMs);
+          }
           const decoder = new TextDecoder();
           let buffer = "";
           let protocolDone = false;
+          let finishReasonSeen = false;
           const idleTimeoutMs = parseIdleTimeout();
           let lastDataAt = Date.now();
           const idleTimeoutError = () =>
@@ -434,8 +477,14 @@ export function streamQoder(
             } else {
               ({ done, value } = await reader.read());
             }
-            if (done) break;
-            if (!value || value.byteLength === 0) {
+            const transportDone = done === true;
+            if (value && value.byteLength > 0) {
+              lastDataAt = Date.now();
+              buffer += decoder.decode(value, { stream: !transportDone });
+              if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+                throw new Error(`Qoder SSE event exceeded ${MAX_SSE_BUFFER_CHARS} characters`);
+              }
+            } else if (!transportDone) {
               if (idleTimeoutMs > 0 && Date.now() - lastDataAt >= idleTimeoutMs) {
                 innerController.abort();
                 throw idleTimeoutError();
@@ -445,8 +494,17 @@ export function streamQoder(
               await delayWithAbort(10, innerController.signal);
               continue;
             }
-            lastDataAt = Date.now();
-            buffer += decoder.decode(value, { stream: true });
+
+            if (transportDone) {
+              const tail = decoder.decode();
+              if (tail) buffer += tail;
+              if (buffer.length > MAX_SSE_BUFFER_CHARS) {
+                throw new Error(`Qoder SSE event exceeded ${MAX_SSE_BUFFER_CHARS} characters`);
+              }
+              // SSE permits the final event to omit the trailing newline. Flush it
+              // through the same parser before deciding whether the stream is valid.
+              if (buffer.length > 0 && !buffer.endsWith("\n")) buffer += "\n";
+            }
 
             while (true) {
               const lineEnd = buffer.indexOf("\n");
@@ -457,14 +515,26 @@ export function streamQoder(
 
               if (!line.startsWith("data:")) continue;
               const dataStr = line.substring(5).trim();
+              if (!dataStr) continue;
               if (dataStr === "[DONE]") {
                 protocolDone = true;
                 break;
               }
 
               try {
-                const envelope = JSON.parse(dataStr);
-                if (envelope.statusCodeValue && envelope.statusCodeValue !== 200) {
+                const parsedEnvelope: unknown = JSON.parse(dataStr);
+                if (!isRecord(parsedEnvelope)) throw new Error("Qoder SSE envelope is not an object");
+                const envelope = parsedEnvelope;
+                const statusCodeValue = envelope.statusCodeValue;
+                const status =
+                  typeof statusCodeValue === "number"
+                    ? statusCodeValue
+                    : typeof statusCodeValue === "string" && statusCodeValue.trim() !== ""
+                      ? Number(statusCodeValue)
+                      : 200;
+                if (!Number.isFinite(status)) throw new Error("Qoder SSE envelope has an invalid status code");
+                if (status !== 200) {
+                  if (typeof envelope.body !== "string") throw new Error("Qoder SSE error envelope has no body");
                   if (process.env.QODER_DEBUG) {
                     console.error(
                       "[pi-provider-qoder] upstream error, sent messages:",
@@ -474,24 +544,27 @@ export function streamQoder(
                   // A 10605 queue payload becomes a typed QoderQueueError so the
                   // retry loop can auto-wait and re-issue; anything else surfaces
                   // as a friendly error message.
-                  const queueError = createQoderQueueError(envelope.statusCodeValue, envelope.body, model.name);
-                  throw (
-                    queueError ??
-                    new Error(formatQoderUpstreamError(envelope.statusCodeValue, envelope.body, model.name))
-                  );
+                  const queueError = createQoderQueueError(status, envelope.body, model.name);
+                  throw queueError ?? new Error(formatQoderUpstreamError(status, envelope.body, model.name));
                 }
 
                 const innerStr = envelope.body;
                 if (!innerStr) continue;
+                if (typeof innerStr !== "string") throw new Error("Qoder SSE envelope body is not a string");
                 if (innerStr === "[DONE]") {
                   protocolDone = true;
                   break;
                 }
 
-                const inner = JSON.parse(innerStr);
-                if (inner.id) output.responseId = inner.id as string;
-                if (inner.model) output.responseModel = inner.model as string;
+                const parsedInner: unknown = JSON.parse(innerStr);
+                if (!isRecord(parsedInner)) throw new Error("Qoder SSE payload is not an object");
+                const inner = parsedInner;
+                if (typeof inner.id === "string" && inner.id) output.responseId = inner.id;
+                if (typeof inner.model === "string" && inner.model) output.responseModel = inner.model;
 
+                if (inner.usage !== undefined && !isRecord(inner.usage)) {
+                  throw new Error("Qoder SSE payload has invalid usage");
+                }
                 if (inner.usage) {
                   const u = inner.usage as {
                     prompt_tokens?: number;
@@ -539,11 +612,25 @@ export function streamQoder(
                   }
                 }
 
-                if (inner.choices && inner.choices.length > 0) {
+                if (inner.choices !== undefined && !Array.isArray(inner.choices)) {
+                  throw new Error("Qoder SSE payload has invalid choices");
+                }
+                if (Array.isArray(inner.choices) && inner.choices.length > 0) {
                   const choice = inner.choices[0];
+                  if (!isRecord(choice)) throw new Error("Qoder SSE payload has an invalid choice");
                   const delta = choice.delta;
 
                   if (delta) {
+                    if (!isRecord(delta)) throw new Error("Qoder SSE payload has an invalid delta");
+                    if (delta.reasoning_content !== undefined && typeof delta.reasoning_content !== "string") {
+                      throw new Error("Qoder SSE payload has non-string reasoning content");
+                    }
+                    if (delta.content !== undefined && typeof delta.content !== "string") {
+                      throw new Error("Qoder SSE payload has non-string content");
+                    }
+                    if (delta.tool_calls !== undefined && !Array.isArray(delta.tool_calls)) {
+                      throw new Error("Qoder SSE payload has invalid tool calls");
+                    }
                     // 1. Reasoning/thinking content (API reasoning channel)
                     if (delta.reasoning_content) {
                       const reasoningChunk = stripThinkingTags(delta.reasoning_content);
@@ -598,14 +685,34 @@ export function streamQoder(
                     }
 
                     // 3. Tool calls
-                    if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    if (Array.isArray(delta.tool_calls)) {
                       for (const tc of delta.tool_calls) {
-                        const idx = tc.index ?? 0;
+                        if (!isRecord(tc)) throw new Error("Qoder SSE payload has an invalid tool call");
+                        const rawIndex = tc.index;
+                        let idx = 0;
+                        if (rawIndex !== undefined) {
+                          if (typeof rawIndex !== "number" || !Number.isInteger(rawIndex) || rawIndex < 0) {
+                            throw new Error("Qoder SSE payload has an invalid tool call index");
+                          }
+                          idx = rawIndex;
+                        }
+                        if (idx >= MAX_TOOL_CALLS) {
+                          throw new Error(`Qoder stream returned more than ${MAX_TOOL_CALLS} tool calls`);
+                        }
                         if (!toolCallsState[idx]) {
                           toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
                         }
                         const state = toolCallsState[idx];
+                        if (tc.id !== undefined && typeof tc.id !== "string") {
+                          throw new Error("Qoder SSE payload has an invalid tool call id");
+                        }
                         if (tc.id) state.id = tc.id;
+                        if (tc.function !== undefined && !isRecord(tc.function)) {
+                          throw new Error("Qoder SSE payload has an invalid tool function");
+                        }
+                        if (tc.function?.name !== undefined && typeof tc.function.name !== "string") {
+                          throw new Error("Qoder SSE payload has an invalid tool name");
+                        }
                         if (tc.function?.name) state.name = tc.function.name;
 
                         // Open the block as soon as the call is IDENTIFIABLE, not when
@@ -622,6 +729,14 @@ export function streamQoder(
                             arguments: {},
                           } satisfies ToolCall);
                           stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
+                          if (state.arguments) {
+                            stream.push({
+                              type: "toolcall_delta",
+                              contentIndex: state.contentIndex,
+                              delta: state.arguments,
+                              partial: output,
+                            });
+                          }
                         }
 
                         // id/name can arrive after the block is open; keep it in step.
@@ -631,45 +746,74 @@ export function streamQoder(
                           block.name = state.name;
                         }
 
+                        if (tc.function?.arguments !== undefined && typeof tc.function.arguments !== "string") {
+                          throw new Error("Qoder SSE payload has non-string tool arguments");
+                        }
                         if (tc.function?.arguments) {
                           const argDelta = tc.function.arguments;
+                          if (state.arguments.length + argDelta.length > MAX_TOOL_ARGUMENT_CHARS) {
+                            throw new Error(`Qoder tool arguments exceeded ${MAX_TOOL_ARGUMENT_CHARS} characters`);
+                          }
                           state.arguments += argDelta;
-                          stream.push({
-                            type: "toolcall_delta",
-                            contentIndex: state.contentIndex,
-                            delta: argDelta,
-                            partial: output,
-                          });
+                          if (state.emittedStart) {
+                            stream.push({
+                              type: "toolcall_delta",
+                              contentIndex: state.contentIndex,
+                              delta: argDelta,
+                              partial: output,
+                            });
+                          }
                         }
                       }
                     }
                   }
 
-                  if (choice.finish_reason) {
-                    // Preserve the real upstream finish_reason instead of forcing "stop".
-                    output.stopReason = choice.finish_reason as AssistantMessage["stopReason"];
+                  if (choice.finish_reason !== undefined && choice.finish_reason !== null) {
+                    if (typeof choice.finish_reason !== "string" || choice.finish_reason.length === 0) {
+                      throw new Error("Qoder SSE payload has an invalid finish reason");
+                    }
+                    finishReasonSeen = true;
+                    switch (choice.finish_reason) {
+                      case "stop":
+                        output.stopReason = "stop";
+                        break;
+                      case "length":
+                        output.stopReason = "length";
+                        break;
+                      case "tool_calls":
+                      case "function_call":
+                        output.stopReason = "toolUse";
+                        break;
+                      case "error":
+                        throw new Error("Qoder stream returned an error finish reason");
+                      default:
+                        throw new Error("Qoder stream returned an unsupported finish reason");
+                    }
                   }
                 }
               } catch (e) {
-                // A single malformed SSE line shouldn't kill the stream — skip it.
-                // But a genuine upstream error must propagate to the outer catch.
+                // A malformed line means the transport no longer gives us a
+                // trustworthy assistant message. Fail the stream so pi can
+                // apply its bounded retry policy instead of treating truncation
+                // as a successful response.
                 if (e instanceof SyntaxError) {
-                  if (process.env.QODER_DEBUG) {
-                    console.error("[pi-provider-qoder] skipping malformed SSE line:", dataStr.slice(0, 200));
-                  }
-                  continue;
+                  throw new Error("Qoder stream ended before a terminal response event (malformed SSE JSON)");
                 }
                 throw e;
               }
             }
 
-            if (protocolDone) {
+            if (protocolDone || finishReasonSeen) {
               // Qoder may keep the HTTP/SSE connection alive after its protocol-level
               // completion marker. Stop consuming immediately instead of waiting for
               // the transport EOF, which can leave pi stuck in the active turn.
               void reader.cancel().catch(() => {});
               innerController.abort();
               break;
+            }
+
+            if (transportDone) {
+              throw new Error("Qoder stream ended before a terminal response event");
             }
           }
 
@@ -688,10 +832,15 @@ export function streamQoder(
           for (const state of toolCallsState) {
             if (state?.emittedStart && !state.emittedEnd) {
               state.emittedEnd = true;
-              let args = {};
-              try {
-                args = JSON.parse(state.arguments || "{}");
-              } catch {}
+              let args: Record<string, unknown> = {};
+              const rawArguments = state.arguments.trim();
+              if (rawArguments) {
+                const parsedArguments: unknown = JSON.parse(rawArguments);
+                if (!isRecord(parsedArguments)) {
+                  throw new Error("Qoder stream returned non-object tool arguments");
+                }
+                args = parsedArguments;
+              }
               const block = output.content[state.contentIndex] as ToolCall;
               block.arguments = args;
               stream.push({
@@ -708,8 +857,15 @@ export function streamQoder(
             }
           }
 
+          const hasToolCalls = toolCallsState.some((state) => state?.emittedStart);
+          if (toolCallsState.some((state) => state && !state.emittedStart && state.arguments.length > 0)) {
+            throw new Error("Qoder stream returned tool arguments without a tool call identity");
+          }
+          if (output.stopReason === "toolUse" && !hasToolCalls) {
+            throw new Error("Qoder stream returned tool_calls finish reason without a tool call");
+          }
           // Guard on blocks that actually reached the message, not on the state array.
-          if (toolCallsState.some((state) => state?.emittedStart)) {
+          if (hasToolCalls) {
             output.stopReason = "toolUse";
           }
 
@@ -719,7 +875,13 @@ export function streamQoder(
             message: output,
           });
           stream.end();
+        } catch (error) {
+          if (streamTimedOut) {
+            throw new Error("Qoder stream timeout: no terminal response was received");
+          }
+          throw error;
         } finally {
+          if (streamTimeoutTimer !== undefined) clearTimeout(streamTimeoutTimer);
           // Always release the response body, including parse/upstream errors and
           // queue retries, so a half-closed proxy connection cannot leak.
           void reader?.cancel().catch(() => {});

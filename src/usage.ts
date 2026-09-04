@@ -1,5 +1,6 @@
 import type { OAuthCredentials } from "@earendil-works/pi-ai";
 import { getQoderManageUrl, getQoderMode, getQoderUsageURL, isQoderCNMode } from "./cosy.js";
+import { withQoderHttpTimeout } from "./http.js";
 
 interface QoderQuota {
   total: number;
@@ -35,20 +36,23 @@ export interface QoderProviderUsage {
 }
 
 async function fetchQoderUsageForMode(credentials: OAuthCredentials, mode: string): Promise<QoderProviderUsage> {
-  const response = await fetch(getQoderUsageURL(mode), {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${credentials.access}`,
-      Accept: "application/json",
-      "User-Agent": "pi-provider-qoder",
-    },
+  const raw = await withQoderHttpTimeout("usage request", undefined, async (signal) => {
+    const response = await fetch(getQoderUsageURL(mode), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${credentials.access}`,
+        Accept: "application/json",
+        "User-Agent": "pi-provider-qoder",
+      },
+      signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to fetch Qoder usage: ${response.status} ${response.statusText}`);
+    }
+
+    return (await response.json()) as QoderUsageInfo;
   });
-
-  if (!response.ok) {
-    throw new Error(`Failed to fetch Qoder usage: ${response.status} ${response.statusText}`);
-  }
-
-  const raw = (await response.json()) as QoderUsageInfo;
   const usageBuckets = [];
 
   if (raw.userQuota) {
@@ -132,7 +136,11 @@ function formatQuotaExhaustedMessage(raw: QoderUsageInfo, mode: string): string 
  * recharge takes effect on the very next request. Any check failure is treated
  * as "not exhausted" — the check must never block a chat request.
  */
-export async function checkQoderQuota(access: string, mode: string): Promise<QoderQuotaCheck> {
+export async function checkQoderQuota(
+  access: string,
+  mode: string,
+  parentSignal?: AbortSignal,
+): Promise<QoderQuotaCheck> {
   if (
     quotaCheckCache &&
     quotaCheckCache.mode === mode &&
@@ -142,23 +150,28 @@ export async function checkQoderQuota(access: string, mode: string): Promise<Qod
     return { exhausted: false };
   }
   try {
-    const response = await fetch(getQoderUsageURL(mode), {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${access}`,
-        Accept: "application/json",
-        "User-Agent": "pi-provider-qoder",
-      },
+    const raw = await withQoderHttpTimeout("quota request", parentSignal, async (signal) => {
+      const response = await fetch(getQoderUsageURL(mode), {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${access}`,
+          Accept: "application/json",
+          "User-Agent": "pi-provider-qoder",
+        },
+        signal,
+      });
+      if (!response.ok) return null;
+      return (await response.json()) as QoderUsageInfo;
     });
-    if (!response.ok) return { exhausted: false };
-    const raw = (await response.json()) as QoderUsageInfo;
+    if (!raw) return { exhausted: false };
     const userRemaining = raw.userQuota?.remaining ?? 0;
     const orgRemaining = raw.orgResourcePackage?.remaining ?? 0;
     const exhausted = raw.isQuotaExceeded === true || (userRemaining <= 0 && orgRemaining <= 0);
     quotaCheckCache = { at: Date.now(), mode, exhausted };
     if (!exhausted) return { exhausted: false };
     return { exhausted: true, message: formatQuotaExhaustedMessage(raw, mode) };
-  } catch {
+  } catch (error) {
+    if (parentSignal?.aborted) throw error;
     return { exhausted: false };
   }
 }

@@ -11,6 +11,7 @@ import {
   logCosyRequest,
   logCosyResponse,
 } from "./cosy.js";
+import { withQoderHttpTimeout } from "./http.js";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
@@ -613,14 +614,18 @@ export async function updateQoderModelsCache(
     const headers = buildAuthHeaders(null, modelListURL, { userID, authToken, name, email });
     logCosyRequest("GET", modelListURL, headers);
 
-    const response = await fetch(modelListURL, {
-      method: "GET",
-      headers: { Accept: "application/json", ...headers },
+    const resData = await withQoderHttpTimeout("model list request", undefined, async (signal) => {
+      const response = await fetch(modelListURL, {
+        method: "GET",
+        headers: { Accept: "application/json", ...headers },
+        signal,
+      });
+      await logCosyResponse(modelListURL, response);
+      if (!response.ok) return null;
+      return (await response.json()) as { chat?: QoderModelEntry[] };
     });
-    await logCosyResponse(modelListURL, response);
-    if (!response.ok) return;
+    if (!resData) return;
 
-    const resData = (await response.json()) as { chat?: QoderModelEntry[] };
     const chatModels = resData.chat || [];
     if (chatModels.length === 0) return;
 

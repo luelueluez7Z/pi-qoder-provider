@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import { getMachineId, getQoderMode, isQoderCNMode } from "./cosy.js";
+import { withQoderHttpTimeout } from "./http.js";
 import { credentialsFromPat } from "./pat.js";
 
 // The pi login dialog wires onPrompt/onAuth/onProgress to a focused input. We
@@ -133,27 +134,36 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
     await abortableDelay(pollInterval, getSignal(callbacks));
 
     try {
-      const response = await fetch(pollURL, {
-        method: "GET",
-        headers: { Accept: "application/json", "User-Agent": "pi-provider-qoder" },
-        signal: getSignal(callbacks),
-      });
+      const response = await withQoderHttpTimeout("device token poll", getSignal(callbacks), (signal) =>
+        fetch(pollURL, {
+          method: "GET",
+          headers: { Accept: "application/json", "User-Agent": "pi-provider-qoder" },
+          signal,
+        }),
+      );
       consecutiveNetworkErrors = 0; // a successful HTTP response clears the counter
 
       if (response.status === 202 || response.status === 404) continue; // pending
 
       if (!response.ok) {
-        const errText = await response.text();
+        const errText = await withQoderHttpTimeout("device token error body", getSignal(callbacks), () =>
+          response.text(),
+        );
         throw new Error(`Device token poll failed: ${response.status} ${response.statusText}. Response: ${errText}`);
       }
 
-      const tokenData = (await response.json()) as {
-        token: string;
-        user_id: string;
-        refresh_token: string;
-        expires_at?: string;
-        expires_in?: number;
-      };
+      const tokenData = await withQoderHttpTimeout(
+        "device token response body",
+        getSignal(callbacks),
+        () =>
+          response.json() as Promise<{
+            token: string;
+            user_id: string;
+            refresh_token: string;
+            expires_at?: string;
+            expires_in?: number;
+          }>,
+      );
       if (!tokenData.token) throw new Error("Device token poll returned empty access token");
       const expireMs = parseExpiresAt(tokenData.expires_at, tokenData.expires_in);
 
@@ -162,16 +172,20 @@ async function runDeviceFlow(callbacks: OAuthLoginCallbacks): Promise<OAuthCrede
       let email = "";
       let name = "";
       try {
-        const userinfoRes = await fetch("https://openapi.qoder.sh/api/v1/userinfo", {
-          method: "GET",
-          headers: {
-            Authorization: `Bearer ${tokenData.token}`,
-            Accept: "application/json",
-            "User-Agent": "pi-provider-qoder",
-          },
+        const userinfo = await withQoderHttpTimeout("device userinfo", getSignal(callbacks), async (signal) => {
+          const userinfoRes = await fetch("https://openapi.qoder.sh/api/v1/userinfo", {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${tokenData.token}`,
+              Accept: "application/json",
+              "User-Agent": "pi-provider-qoder",
+            },
+            signal,
+          });
+          if (!userinfoRes.ok) return null;
+          return (await userinfoRes.json()) as { email?: string; name?: string; username?: string };
         });
-        if (userinfoRes.ok) {
-          const userinfo = (await userinfoRes.json()) as { email?: string; name?: string; username?: string };
+        if (userinfo) {
           email = userinfo.email || "";
           name = userinfo.name || userinfo.username || "";
         }

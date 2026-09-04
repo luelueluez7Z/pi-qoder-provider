@@ -11,6 +11,7 @@ import {
   getQoderUserEmailFallback,
   isQoderCNMode,
 } from "./cosy.js";
+import { withQoderHttpTimeout } from "./http.js";
 import { interactiveLogin } from "./login.js";
 import { updateQoderModelsCache } from "./models.js";
 import {
@@ -168,6 +169,7 @@ export async function resolveQoderIdentity(
   accessToken: string,
   providerID = "qoder",
   mode?: string,
+  parentSignal?: AbortSignal,
 ): Promise<QoderCredentials> {
   const resolvedMode = mode ?? (providerID === "qoder-cn" ? "cn" : getQoderMode());
   const providerLabel = isQoderCNMode(resolvedMode) ? "Qoder CN" : "Qoder";
@@ -189,7 +191,7 @@ export async function resolveQoderIdentity(
     return { access: accessToken, refresh: "", expires: 0, ...cached };
   }
 
-  const info = await fetchUserInfo(accessToken, resolvedMode);
+  const info = await fetchUserInfo(accessToken, resolvedMode, parentSignal);
   if (!info.userID) {
     throw new Error(
       `${providerLabel} identity unavailable: ~/.pi/agent/auth.json has no userID and /userinfo did not return one. ` +
@@ -330,25 +332,28 @@ async function refreshQoderTokenForMode(credentials: OAuthCredentials, mode: str
 
   const refreshURL = getQoderRefreshURL(mode);
   try {
-    const response = await fetch(refreshURL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${credentials.access}`,
-        Accept: "application/json",
-        "User-Agent": "pi-provider-qoder",
-      },
-      body: JSON.stringify({ refreshToken }),
-    });
-
-    if (response.ok) {
-      const data = (await response.json()) as {
+    const data = await withQoderHttpTimeout("token refresh", undefined, async (signal) => {
+      const response = await fetch(refreshURL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${credentials.access}`,
+          Accept: "application/json",
+          "User-Agent": "pi-provider-qoder",
+        },
+        body: JSON.stringify({ refreshToken }),
+        signal,
+      });
+      if (!response.ok) return null;
+      return (await response.json()) as {
         token: string;
         refresh_token?: string;
         expires_at?: string;
         expires_in?: number;
       };
+    });
 
+    if (data) {
       const newAccess = data.token;
       const newRefresh = data.refresh_token || refreshToken;
 

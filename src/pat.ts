@@ -9,6 +9,7 @@ import {
   getQoderUserInfoURL,
   isQoderCNMode,
 } from "./cosy.js";
+import { withQoderHttpTimeout } from "./http.js";
 
 const USER_AGENT = "pi-provider-qoder";
 
@@ -92,32 +93,37 @@ export function decodePatRefresh(refresh: string): {
  * The exchange endpoint does not require a COSY signature.
  */
 export async function exchangeJobToken(pat: string, mode: string = getQoderMode()): Promise<PatExchangeResult> {
-  const res = await fetch(getQoderExchangeURL(mode), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      "User-Agent": USER_AGENT,
-      "Cosy-Version": "1.0.1",
-      "Cosy-ClientType": "5",
-    },
-    body: JSON.stringify({ personal_token: pat }),
+  const data = await withQoderHttpTimeout("PAT exchange", undefined, async (signal) => {
+    const res = await fetch(getQoderExchangeURL(mode), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": USER_AGENT,
+        "Cosy-Version": "1.0.1",
+        "Cosy-ClientType": "5",
+      },
+      body: JSON.stringify({ personal_token: pat }),
+      signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        formatQoderHttpError("pat-exchange", res.status, res.statusText, text, getQoderExchangeURL(mode)),
+      );
+    }
+
+    return (await res.json()) as {
+      token?: string;
+      refresh_token?: string;
+      created_at?: string;
+      expires_at?: string;
+      expires_in?: number; // milliseconds on VPC/CN OpenAPI
+      refresh_token_expires_at?: string;
+      refresh_token_expires_in?: number;
+    };
   });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(formatQoderHttpError("pat-exchange", res.status, res.statusText, text, getQoderExchangeURL(mode)));
-  }
-
-  const data = (await res.json()) as {
-    token?: string;
-    refresh_token?: string;
-    created_at?: string;
-    expires_at?: string;
-    expires_in?: number; // milliseconds on VPC/CN OpenAPI
-    refresh_token_expires_at?: string;
-    refresh_token_expires_in?: number;
-  };
 
   if (!data.token) throw new Error("Qoder PAT exchange returned no job token");
 
@@ -148,34 +154,37 @@ export async function refreshJobToken(
     throw new Error("Qoder job token refresh requires a non-empty refresh_token (jrt-...)");
   }
 
-  const res = await fetch(getQoderJobTokenRefreshURL(mode), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "application/json",
-      "User-Agent": USER_AGENT,
-      "Cosy-Version": "1.0.1",
-      "Cosy-ClientType": "5",
-    },
-    body: JSON.stringify({ refresh_token: jobRefreshToken }),
+  const data = await withQoderHttpTimeout("job token refresh", undefined, async (signal) => {
+    const res = await fetch(getQoderJobTokenRefreshURL(mode), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": USER_AGENT,
+        "Cosy-Version": "1.0.1",
+        "Cosy-ClientType": "5",
+      },
+      body: JSON.stringify({ refresh_token: jobRefreshToken }),
+      signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(
+        formatQoderHttpError("pat-exchange", res.status, res.statusText, text, getQoderJobTokenRefreshURL(mode)),
+      );
+    }
+
+    return (await res.json()) as {
+      token?: string;
+      refresh_token?: string;
+      created_at?: string;
+      expires_at?: string;
+      expires_in?: number; // milliseconds on VPC/CN OpenAPI
+      refresh_token_expires_at?: string;
+      refresh_token_expires_in?: number;
+    };
   });
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(
-      formatQoderHttpError("pat-exchange", res.status, res.statusText, text, getQoderJobTokenRefreshURL(mode)),
-    );
-  }
-
-  const data = (await res.json()) as {
-    token?: string;
-    refresh_token?: string;
-    created_at?: string;
-    expires_at?: string;
-    expires_in?: number; // milliseconds on VPC/CN OpenAPI
-    refresh_token_expires_at?: string;
-    refresh_token_expires_in?: number;
-  };
 
   if (!data.token) throw new Error("Qoder job token refresh returned no job token");
 
@@ -195,27 +204,35 @@ export async function refreshJobToken(
 }
 
 /** Fetch user profile using a job/access token (jt-...). Returns empty fields on failure. */
-export async function fetchUserInfo(jobToken: string, mode: string): Promise<QoderUserInfo> {
+export async function fetchUserInfo(
+  jobToken: string,
+  mode: string,
+  parentSignal?: AbortSignal,
+): Promise<QoderUserInfo> {
   let userID = "";
   let email = "";
   let name = "";
   try {
-    const res = await fetch(getQoderUserInfoURL(mode), {
-      headers: {
-        Authorization: `Bearer ${jobToken}`,
-        Accept: "application/json",
-        "User-Agent": USER_AGENT,
-        "Cosy-Version": "1.0.1",
-        "Cosy-ClientType": "5",
-      },
+    await withQoderHttpTimeout("userinfo request", parentSignal, async (signal) => {
+      const res = await fetch(getQoderUserInfoURL(mode), {
+        headers: {
+          Authorization: `Bearer ${jobToken}`,
+          Accept: "application/json",
+          "User-Agent": USER_AGENT,
+          "Cosy-Version": "1.0.1",
+          "Cosy-ClientType": "5",
+        },
+        signal,
+      });
+      if (res.ok) {
+        const info = (await res.json()) as { id?: string; email?: string; name?: string; username?: string };
+        userID = typeof info.id === "string" ? info.id : "";
+        email = typeof info.email === "string" ? info.email : "";
+        name = typeof info.name === "string" ? info.name : typeof info.username === "string" ? info.username : "";
+      }
     });
-    if (res.ok) {
-      const info = (await res.json()) as { id?: string; email?: string; name?: string; username?: string };
-      userID = info.id || "";
-      email = info.email || "";
-      name = info.name || info.username || "";
-    }
-  } catch {
+  } catch (error) {
+    if (parentSignal) throw error;
     // Callers decide whether empty identity is fatal.
   }
   return { userID, email, name };

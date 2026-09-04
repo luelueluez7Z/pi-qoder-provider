@@ -217,6 +217,8 @@ describe("streamQoder", () => {
     globalThis.fetch = originalFetch;
     delete process.env.QODER_QUEUE_RETRY_MAX;
     delete process.env.QODER_IDLE_TIMEOUT_MS;
+    delete process.env.QODER_STREAM_TIMEOUT_MS;
+    delete process.env.QODER_HTTP_TIMEOUT_MS;
     resetQoderQuotaCache();
     vi.restoreAllMocks();
   });
@@ -256,6 +258,81 @@ describe("streamQoder", () => {
       "expected a done event at the protocol marker",
     ).toBeDefined();
     expect(cancelled, "the still-open response body should be cancelled").toBe(true);
+  });
+
+  it("rejects a transport EOF that arrives before a terminal response event", async () => {
+    globalThis.fetch = mockFetch(sseEnvelope(chunk({ content: "partial", role: "assistant" })));
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((event) => event.type === "error");
+    expect(err, "expected an error event for a truncated stream").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("ended before a terminal response event");
+    expect(events.find((event) => event.type === "done")).toBeUndefined();
+  });
+
+  it("rejects malformed SSE JSON instead of treating it as a successful response", async () => {
+    globalThis.fetch = mockFetch("data:{not-json}\n\n");
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((event) => event.type === "error");
+    expect(err, "expected an error event for malformed SSE").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("malformed SSE JSON");
+  });
+
+  it("rejects malformed tool arguments instead of executing an empty object", async () => {
+    const malformedTool =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call-1", function: { name: "bash", arguments: '{"command":' } }],
+        }),
+      ) + sseEnvelope(finishChunk("tool_calls"));
+    globalThis.fetch = mockFetch(malformedTool);
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((event) => event.type === "error");
+    expect(err, "expected an error event for malformed tool arguments").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("Unexpected end");
+    expect(events.find((event) => event.type === "done")).toBeUndefined();
+  });
+
+  it("rejects a tool_calls finish reason when no tool call was emitted", async () => {
+    globalThis.fetch = mockFetch(sseEnvelope(finishChunk("tool_calls")));
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((event) => event.type === "error");
+    expect(err, "expected an error event for an empty tool_calls response").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("without a tool call");
+  });
+
+  it("aborts a response that remains open after data without a terminal event", async () => {
+    process.env.QODER_STREAM_TIMEOUT_MS = "50";
+    globalThis.fetch = openEndedFetch(sseEnvelope(chunk({ content: "partial", role: "assistant" })), () => {});
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+
+    const err = events.find((event) => event.type === "error");
+    expect(err, "expected an error event after the stream timeout").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("stream timeout");
+  });
+
+  it("times out a chat connection that never returns response headers", async () => {
+    process.env.QODER_HTTP_TIMEOUT_MS = "20";
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/userinfo")) return jsonResponse(JSON.stringify({ id: "user-test" }));
+      if (url.includes("/quota/usage")) return jsonResponse(QUOTA_OK_JSON);
+      return await new Promise<Response>(() => {});
+    }) as unknown as typeof fetch;
+
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await consume(stream);
+    const err = events.find((event) => event.type === "error");
+    expect(err, "expected a connection timeout error").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("chat connection timeout");
   });
 
   it("surfaces an upstream 406 'Session blocked' as an error event and releases its response body", async () => {
@@ -449,6 +526,22 @@ describe("streamQoder", () => {
     const msg = (done as { message: AssistantMessage }).message;
     const toolCall = msg.content.find((c) => c.type === "toolCall") as ToolCall | undefined;
     expect(toolCall?.id).toBe("call_9");
+    expect(toolCall?.name).toBe("bash");
+    expect(toolCall?.arguments).toEqual({ command: "ls" });
+  });
+
+  it("buffers tool arguments until the call identity arrives", async () => {
+    const sse =
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, function: { arguments: '{"command":"ls"}' } }] })) +
+      sseEnvelope(chunk({ tool_calls: [{ index: 0, id: "call_10", function: { name: "bash" } }] })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const done = events.find((event) => event.type === "done");
+    const msg = (done as { message: AssistantMessage }).message;
+    const toolCall = msg.content.find((content) => content.type === "toolCall") as ToolCall | undefined;
     expect(toolCall?.name).toBe("bash");
     expect(toolCall?.arguments).toEqual({ command: "ls" });
   });
