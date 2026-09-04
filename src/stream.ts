@@ -291,6 +291,7 @@ export function streamQoder(
         // (hung upstream, e.g. quota exhausted) can tear the fetch down.
         const innerController = new AbortController();
         const onExternalAbort = () => innerController.abort();
+        let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
         options?.signal?.addEventListener("abort", onExternalAbort, { once: true });
         try {
           const reqBody: Record<string, unknown> = {
@@ -387,11 +388,17 @@ export function streamQoder(
             throw new Error(formatQoderHttpError("api", response.status, response.statusText, errText, chatURL));
           }
 
-          const reader = response.body?.getReader();
+          reader = response.body?.getReader();
           if (!reader) throw new Error("No response body");
           const decoder = new TextDecoder();
           let buffer = "";
+          let protocolDone = false;
           const idleTimeoutMs = parseIdleTimeout();
+          let lastDataAt = Date.now();
+          const idleTimeoutError = () =>
+            new Error(
+              "Qoder 模型长时间未返回响应（可能积分已用完或服务繁忙），已中止本次请求。请检查 Qoder 账户额度或稍后重试。",
+            );
 
           let contentBlockIndex = -1;
           let thinkingBlockIndex = -1;
@@ -405,30 +412,41 @@ export function streamQoder(
             // A stream that delivers nothing for the idle window is hung — the
             // upstream answered 200 and then went silent (e.g. quota exhausted).
             // Abort and surface a friendly message instead of spinning forever.
+            let done: boolean | undefined;
+            let value: Uint8Array | undefined;
             if (idleTimeoutMs > 0) {
               let readTimer: ReturnType<typeof setTimeout> | undefined;
+              const remainingIdleMs = Math.max(1, idleTimeoutMs - (Date.now() - lastDataAt));
               const idle = new Promise<never>((_, reject) => {
                 readTimer = setTimeout(() => {
                   innerController.abort();
-                  reject(
-                    new Error(
-                      "Qoder 模型长时间未返回响应（可能积分已用完或服务繁忙），已中止本次请求。请检查 Qoder 账户额度或稍后重试。",
-                    ),
-                  );
-                }, idleTimeoutMs);
+                  reject(idleTimeoutError());
+                }, remainingIdleMs);
               });
               const readPromise = reader.read();
               // Ignore the late rejection once the idle abort tears the fetch down.
               readPromise.catch(() => {});
-              const { done, value } = await Promise.race([readPromise, idle]);
-              clearTimeout(readTimer);
-              if (done) break;
-              buffer += decoder.decode(value, { stream: true });
+              try {
+                ({ done, value } = await Promise.race([readPromise, idle]));
+              } finally {
+                if (readTimer !== undefined) clearTimeout(readTimer);
+              }
             } else {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buffer += decoder.decode(value, { stream: true });
+              ({ done, value } = await reader.read());
             }
+            if (done) break;
+            if (!value || value.byteLength === 0) {
+              if (idleTimeoutMs > 0 && Date.now() - lastDataAt >= idleTimeoutMs) {
+                innerController.abort();
+                throw idleTimeoutError();
+              }
+              // A broken transport can resolve read() repeatedly without making
+              // progress. Yield so that it cannot starve terminal input or timers.
+              await delayWithAbort(10, innerController.signal);
+              continue;
+            }
+            lastDataAt = Date.now();
+            buffer += decoder.decode(value, { stream: true });
 
             while (true) {
               const lineEnd = buffer.indexOf("\n");
@@ -439,7 +457,10 @@ export function streamQoder(
 
               if (!line.startsWith("data:")) continue;
               const dataStr = line.substring(5).trim();
-              if (dataStr === "[DONE]") break;
+              if (dataStr === "[DONE]") {
+                protocolDone = true;
+                break;
+              }
 
               try {
                 const envelope = JSON.parse(dataStr);
@@ -461,7 +482,11 @@ export function streamQoder(
                 }
 
                 const innerStr = envelope.body;
-                if (!innerStr || innerStr === "[DONE]") continue;
+                if (!innerStr) continue;
+                if (innerStr === "[DONE]") {
+                  protocolDone = true;
+                  break;
+                }
 
                 const inner = JSON.parse(innerStr);
                 if (inner.id) output.responseId = inner.id as string;
@@ -637,6 +662,15 @@ export function streamQoder(
                 throw e;
               }
             }
+
+            if (protocolDone) {
+              // Qoder may keep the HTTP/SSE connection alive after its protocol-level
+              // completion marker. Stop consuming immediately instead of waiting for
+              // the transport EOF, which can leave pi stuck in the active turn.
+              void reader.cancel().catch(() => {});
+              innerController.abort();
+              break;
+            }
           }
 
           if (thinkingParser) thinkingParser.finalize();
@@ -686,6 +720,10 @@ export function streamQoder(
           });
           stream.end();
         } finally {
+          // Always release the response body, including parse/upstream errors and
+          // queue retries, so a half-closed proxy connection cannot leak.
+          void reader?.cancel().catch(() => {});
+          innerController.abort();
           options?.signal?.removeEventListener("abort", onExternalAbort);
         }
       };

@@ -122,6 +122,50 @@ function mockFetch(body: string): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
+/** Return a chat response whose body emits the supplied SSE data but never closes. */
+function openEndedFetch(body: string, onCancel: () => void): typeof fetch {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes("/userinfo")) {
+      return jsonResponse(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }));
+    }
+    if (url.includes("/quota/usage")) {
+      return jsonResponse(QUOTA_OK_JSON);
+    }
+    const responseBody = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode(body));
+      },
+      cancel() {
+        onCancel();
+      },
+    });
+    return new Response(responseBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }) as unknown as typeof fetch;
+}
+
+/** Return a chat response whose body repeatedly yields empty chunks. */
+function zeroProgressFetch(onCancel: () => void): typeof fetch {
+  return vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes("/userinfo")) {
+      return jsonResponse(JSON.stringify({ id: "user-test", email: "t@qoder.com", name: "T" }));
+    }
+    if (url.includes("/quota/usage")) {
+      return jsonResponse(QUOTA_OK_JSON);
+    }
+    const responseBody = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array());
+      },
+      cancel() {
+        onCancel();
+      },
+    });
+    return new Response(responseBody, { status: 200, headers: { "content-type": "text/event-stream" } });
+  }) as unknown as typeof fetch;
+}
+
 /** Return a fresh Response per call, so each chat attempt gets its own body. */
 function sequenceFetch(bodies: string[]): typeof fetch {
   let call = 0;
@@ -190,8 +234,35 @@ describe("streamQoder", () => {
     expect(text && "text" in text ? text.text : "").toBe("OK");
   });
 
-  it("surfaces an upstream 406 'Session blocked' as an error event, not a silent stop", async () => {
-    globalThis.fetch = mockFetch(BLOCKED_SSE);
+  it.each([
+    ["nested Qoder envelope", DONE_SSE],
+    ["raw SSE marker", "data: [DONE]\n\n"],
+  ])("finishes at the %s DONE marker without waiting for transport EOF", async (_label, doneMarker) => {
+    let cancelled = false;
+    const sse =
+      sseEnvelope(chunk({ content: "OK", role: "assistant" })) + sseEnvelope(finishChunk("stop")) + doneMarker;
+    globalThis.fetch = openEndedFetch(sse, () => {
+      cancelled = true;
+    });
+
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await Promise.race([
+      consume(stream),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("stream waited for transport EOF")), 250)),
+    ]);
+
+    expect(
+      events.find((event) => event.type === "done"),
+      "expected a done event at the protocol marker",
+    ).toBeDefined();
+    expect(cancelled, "the still-open response body should be cancelled").toBe(true);
+  });
+
+  it("surfaces an upstream 406 'Session blocked' as an error event and releases its response body", async () => {
+    let cancelled = false;
+    globalThis.fetch = openEndedFetch(BLOCKED_SSE, () => {
+      cancelled = true;
+    });
     const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
     const events = await consume(stream);
 
@@ -202,6 +273,26 @@ describe("streamQoder", () => {
     expect(msg.errorMessage).toMatch(/Session blocked/);
     expect(msg.errorMessage).toMatch(/406/);
     expect(events.find((e) => e.type === "done")).toBeUndefined();
+    expect(cancelled, "the errored response body should be cancelled").toBe(true);
+  });
+
+  it("times out repeated empty reads without starving the event loop", async () => {
+    process.env.QODER_IDLE_TIMEOUT_MS = "30";
+    let cancelled = false;
+    globalThis.fetch = zeroProgressFetch(() => {
+      cancelled = true;
+    });
+
+    const stream = streamQoder(makeModel(), makeContext(), { apiKey: "fake" });
+    const events = await Promise.race([
+      consume(stream),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("empty reads caused a busy loop")), 250)),
+    ]);
+
+    const err = events.find((event) => event.type === "error");
+    expect(err, "expected an idle timeout error").toBeDefined();
+    expect((err as { error: AssistantMessage }).error.errorMessage).toMatch(/长时间未返回响应/);
+    expect(cancelled, "the zero-progress response body should be cancelled").toBe(true);
   });
 
   it("preserves finish_reason=length instead of overwriting to stop", async () => {
