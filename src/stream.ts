@@ -30,6 +30,8 @@ import {
   logCosyResponse,
   QoderQueueError,
 } from "./cosy.js";
+import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
+import { DsmlToolParser } from "./dsml.js";
 import { withQoderHttpTimeout } from "./http.js";
 import { getCachedModelConfig } from "./models.js";
 import { resolveQoderIdentity } from "./oauth.js";
@@ -45,6 +47,44 @@ interface ToolCallState {
   emittedStart?: boolean;
   emittedEnd?: boolean;
   contentIndex: number;
+}
+
+function logStreamDebug(event: string, details: Record<string, unknown>): void {
+  if (isQoderDebugEnabled()) logDebug("stream", { event, ...details });
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function describeErrorDetails(error: unknown): Record<string, unknown> {
+  if (!(error instanceof Error)) return { type: typeof error, message: String(error) };
+  const value = error as Error & {
+    code?: unknown;
+    errno?: unknown;
+    syscall?: unknown;
+    cause?: unknown;
+  };
+  const details: Record<string, unknown> = {
+    name: value.name,
+    message: value.message,
+    code: value.code,
+    errno: value.errno,
+    syscall: value.syscall,
+  };
+  if (value.cause instanceof Error) {
+    const cause = value.cause as Error & { code?: unknown; errno?: unknown; syscall?: unknown };
+    details.cause = {
+      name: cause.name,
+      message: cause.message,
+      code: cause.code,
+      errno: cause.errno,
+      syscall: cause.syscall,
+    };
+  } else if (value.cause !== undefined) {
+    details.cause = String(value.cause);
+  }
+  return details;
 }
 
 function stableHash(prefix: string, ...inputs: string[]): string {
@@ -307,19 +347,33 @@ export function streamQoder(
       const attemptOnce = async (): Promise<void> => {
         // Inner AbortController so both the caller's signal and an idle timeout
         // (hung upstream, e.g. quota exhausted) can tear the fetch down.
+        const attemptStartedAt = Date.now();
         const innerController = new AbortController();
         let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+        let requestId = "";
+        let readCount = 0;
+        let totalReadBytes = 0;
+        let sseEventCount = 0;
+        let lastReadAt = attemptStartedAt;
         const onExternalAbort = () => {
+          logStreamDebug("external-abort", {
+            requestId,
+            elapsedMs: Date.now() - attemptStartedAt,
+            readCount,
+            totalReadBytes,
+            sseEventCount,
+          });
           innerController.abort();
-          void reader?.cancel().catch(() => {});
+          void reader?.cancel().catch(() => { });
         };
         let streamTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
         let streamTimedOut = false;
         options?.signal?.addEventListener("abort", onExternalAbort, { once: true });
         try {
           if (options?.signal?.aborted) throw new Error("aborted");
+          requestId = crypto.randomUUID();
           const reqBody: Record<string, unknown> = {
-            request_id: crypto.randomUUID(),
+            request_id: requestId,
             request_set_id: recordID,
             chat_record_id: recordID,
             session_id: sessionID,
@@ -382,6 +436,16 @@ export function streamQoder(
           const encodedBody = qoderEncodeBody(bodyBytes);
           const encodedBytes = Buffer.from(encodedBody, "utf8");
 
+          logStreamDebug("request", {
+            requestId,
+            sessionId: sessionID,
+            model: qoderModel,
+            bodyBytes: bodyBytes.byteLength,
+            encodedBytes: encodedBytes.byteLength,
+            messageCount: Array.isArray(reqBody.messages) ? reqBody.messages.length : 0,
+            toolCount: Array.isArray(reqBody.tools) ? reqBody.tools.length : 0,
+          });
+
           const chatURL = getQoderChatURL(providerMode);
 
           const headers = buildAuthHeaders(encodedBytes, chatURL, {
@@ -414,6 +478,12 @@ export function streamQoder(
           await withQoderHttpTimeout("chat response logging", innerController.signal, () =>
             logCosyResponse(chatURL, response),
           );
+          logStreamDebug("response", {
+            requestId,
+            status: response.status,
+            statusText: response.statusText,
+            elapsedMs: Date.now() - attemptStartedAt,
+          });
 
           if (!response.ok) {
             const errText = await withQoderHttpTimeout("chat error body", innerController.signal, () =>
@@ -424,12 +494,25 @@ export function streamQoder(
 
           reader = response.body?.getReader();
           if (!reader) throw new Error("No response body");
+          logStreamDebug("reader-open", {
+            requestId,
+            elapsedMs: Date.now() - attemptStartedAt,
+            contentType: response.headers.get("content-type"),
+          });
           const streamTimeoutMs = parseStreamTimeout();
           if (streamTimeoutMs > 0) {
             streamTimeoutTimer = setTimeout(() => {
               streamTimedOut = true;
+              logStreamDebug("stream-timeout", {
+                requestId,
+                timeoutMs: streamTimeoutMs,
+                elapsedMs: Date.now() - attemptStartedAt,
+                readCount,
+                totalReadBytes,
+                sseEventCount,
+              });
               innerController.abort();
-              void reader?.cancel().catch(() => {});
+              void reader?.cancel().catch(() => { });
             }, streamTimeoutMs);
           }
           const decoder = new TextDecoder();
@@ -451,6 +534,85 @@ export function streamQoder(
             (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
           const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
 
+          const endApiThinking = () => {
+            if (thinkingBlockIndex === -1) return;
+            const block = output.content[thinkingBlockIndex] as ThinkingContent;
+            stream.push({
+              type: "thinking_end",
+              contentIndex: thinkingBlockIndex,
+              content: block.thinking,
+              partial: output,
+            });
+            thinkingBlockIndex = -1;
+          };
+
+          const appendText = (text: string) => {
+            if (!text) return;
+            endApiThinking();
+            if (thinkingParser) {
+              thinkingParser.processChunk(text);
+              return;
+            }
+            if (contentBlockIndex === -1) {
+              contentBlockIndex = output.content.length;
+              output.content.push({ type: "text", text: "" });
+              stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
+            }
+            const block = output.content[contentBlockIndex] as TextContent;
+            block.text += text;
+            stream.push({
+              type: "text_delta",
+              contentIndex: contentBlockIndex,
+              delta: text,
+              partial: output,
+            });
+          };
+
+          const dsmlParser = new DsmlToolParser(appendText, ({ name, arguments: args }) => {
+            logStreamDebug("dsml-tool-call", {
+              requestId,
+              name,
+              argumentChars: JSON.stringify(args).length,
+            });
+            if (toolCallsState.length >= MAX_TOOL_CALLS) {
+              throw new Error(`Qoder stream returned more than ${MAX_TOOL_CALLS} tool calls`);
+            }
+            endApiThinking();
+            const index = toolCallsState.length;
+            const id = `dsml-${requestId}-${index}`;
+            const contentIndex = output.content.length;
+            const serializedArguments = JSON.stringify(args);
+            output.content.push({
+              type: "toolCall",
+              id,
+              name,
+              arguments: args,
+            } satisfies ToolCall);
+            stream.push({ type: "toolcall_start", contentIndex, partial: output });
+            if (serializedArguments !== "{}") {
+              stream.push({
+                type: "toolcall_delta",
+                contentIndex,
+                delta: serializedArguments,
+                partial: output,
+              });
+            }
+            stream.push({
+              type: "toolcall_end",
+              contentIndex,
+              toolCall: { type: "toolCall", id, name, arguments: args },
+              partial: output,
+            });
+            toolCallsState[index] = {
+              arguments: serializedArguments,
+              id,
+              name,
+              emittedStart: true,
+              emittedEnd: true,
+              contentIndex,
+            };
+          });
+
           while (true) {
             // A stream that delivers nothing for the idle window is hung — the
             // upstream answered 200 and then went silent (e.g. quota exhausted).
@@ -462,13 +624,22 @@ export function streamQoder(
               const remainingIdleMs = Math.max(1, idleTimeoutMs - (Date.now() - lastDataAt));
               const idle = new Promise<never>((_, reject) => {
                 readTimer = setTimeout(() => {
+                  logStreamDebug("idle-timeout", {
+                    requestId,
+                    timeoutMs: idleTimeoutMs,
+                    elapsedMs: Date.now() - attemptStartedAt,
+                    readCount,
+                    totalReadBytes,
+                    sseEventCount,
+                    lastReadAgeMs: Date.now() - lastReadAt,
+                  });
                   innerController.abort();
                   reject(idleTimeoutError());
                 }, remainingIdleMs);
               });
               const readPromise = reader.read();
               // Ignore the late rejection once the idle abort tears the fetch down.
-              readPromise.catch(() => {});
+              readPromise.catch(() => { });
               try {
                 ({ done, value } = await Promise.race([readPromise, idle]));
               } finally {
@@ -477,14 +648,37 @@ export function streamQoder(
             } else {
               ({ done, value } = await reader.read());
             }
+            const readAt = Date.now();
             const transportDone = done === true;
-            if (value && value.byteLength > 0) {
-              lastDataAt = Date.now();
-              buffer += decoder.decode(value, { stream: !transportDone });
+            const readBytes = value?.byteLength ?? 0;
+            readCount += 1;
+            if (readBytes > 0) {
+              const gapMs = readAt - lastReadAt;
+              lastReadAt = readAt;
+              totalReadBytes += readBytes;
+              logStreamDebug("read", {
+                requestId,
+                readCount,
+                bytes: readBytes,
+                totalReadBytes,
+                gapMs,
+                transportDone,
+                elapsedMs: readAt - attemptStartedAt,
+              });
+              lastDataAt = readAt;
+              buffer += decoder.decode(value!, { stream: !transportDone });
               if (buffer.length > MAX_SSE_BUFFER_CHARS) {
                 throw new Error(`Qoder SSE event exceeded ${MAX_SSE_BUFFER_CHARS} characters`);
               }
             } else if (!transportDone) {
+              if (readCount === 1 || readCount % 100 === 0) {
+                logStreamDebug("read-empty", {
+                  requestId,
+                  readCount,
+                  totalReadBytes,
+                  elapsedMs: readAt - attemptStartedAt,
+                });
+              }
               if (idleTimeoutMs > 0 && Date.now() - lastDataAt >= idleTimeoutMs) {
                 innerController.abort();
                 throw idleTimeoutError();
@@ -517,6 +711,14 @@ export function streamQoder(
               const dataStr = line.substring(5).trim();
               if (!dataStr) continue;
               if (dataStr === "[DONE]") {
+                logStreamDebug("terminal", {
+                  requestId,
+                  reason: "raw-done",
+                  elapsedMs: Date.now() - attemptStartedAt,
+                  readCount,
+                  totalReadBytes,
+                  sseEventCount,
+                });
                 protocolDone = true;
                 break;
               }
@@ -533,13 +735,17 @@ export function streamQoder(
                       ? Number(statusCodeValue)
                       : 200;
                 if (!Number.isFinite(status)) throw new Error("Qoder SSE envelope has an invalid status code");
+                sseEventCount += 1;
                 if (status !== 200) {
                   if (typeof envelope.body !== "string") throw new Error("Qoder SSE error envelope has no body");
-                  if (process.env.QODER_DEBUG) {
-                    console.error(
-                      "[pi-provider-qoder] upstream error, sent messages:",
-                      JSON.stringify(reqBody.messages, null, 2),
-                    );
+                  if (isQoderDebugEnabled()) {
+                    logDebug("stream-error", {
+                      requestId,
+                      eventNo: sseEventCount,
+                      status,
+                      body: envelope.body.slice(0, 500),
+                      sentMessages: reqBody.messages,
+                    });
                   }
                   // A 10605 queue payload becomes a typed QoderQueueError so the
                   // retry loop can auto-wait and re-issue; anything else surfaces
@@ -552,6 +758,14 @@ export function streamQoder(
                 if (!innerStr) continue;
                 if (typeof innerStr !== "string") throw new Error("Qoder SSE envelope body is not a string");
                 if (innerStr === "[DONE]") {
+                  logStreamDebug("terminal", {
+                    requestId,
+                    reason: "envelope-done",
+                    eventNo: sseEventCount,
+                    elapsedMs: Date.now() - attemptStartedAt,
+                    readCount,
+                    totalReadBytes,
+                  });
                   protocolDone = true;
                   break;
                 }
@@ -615,6 +829,22 @@ export function streamQoder(
                 if (inner.choices !== undefined && !Array.isArray(inner.choices)) {
                   throw new Error("Qoder SSE payload has invalid choices");
                 }
+                const firstChoice = Array.isArray(inner.choices) && isRecord(inner.choices[0]) ? inner.choices[0] : undefined;
+                const firstDelta = firstChoice && isRecord(firstChoice.delta) ? firstChoice.delta : undefined;
+                logStreamDebug("event", {
+                  requestId,
+                  eventNo: sseEventCount,
+                  bodyChars: innerStr.length,
+                  responseId: typeof inner.id === "string" ? inner.id : undefined,
+                  model: typeof inner.model === "string" ? inner.model : undefined,
+                  choiceCount: Array.isArray(inner.choices) ? inner.choices.length : 0,
+                  finishReason: firstChoice?.finish_reason,
+                  contentChars: typeof firstDelta?.content === "string" ? firstDelta.content.length : 0,
+                  reasoningChars:
+                    typeof firstDelta?.reasoning_content === "string" ? firstDelta.reasoning_content.length : 0,
+                  toolCallCount: Array.isArray(firstDelta?.tool_calls) ? firstDelta.tool_calls.length : 0,
+                  elapsedMs: Date.now() - attemptStartedAt,
+                });
                 if (Array.isArray(inner.choices) && inner.choices.length > 0) {
                   const choice = inner.choices[0];
                   if (!isRecord(choice)) throw new Error("Qoder SSE payload has an invalid choice");
@@ -651,38 +881,8 @@ export function streamQoder(
                       }
                     }
 
-                    // 2. Text content
-                    if (delta.content) {
-                      // End API thinking block if active
-                      if (thinkingBlockIndex !== -1) {
-                        const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                        stream.push({
-                          type: "thinking_end",
-                          contentIndex: thinkingBlockIndex,
-                          content: block.thinking,
-                          partial: output,
-                        });
-                        thinkingBlockIndex = -1;
-                      }
-
-                      if (thinkingParser) {
-                        thinkingParser.processChunk(delta.content);
-                      } else {
-                        if (contentBlockIndex === -1) {
-                          contentBlockIndex = output.content.length;
-                          output.content.push({ type: "text", text: "" });
-                          stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-                        }
-                        const block = output.content[contentBlockIndex] as TextContent;
-                        block.text += delta.content;
-                        stream.push({
-                          type: "text_delta",
-                          contentIndex: contentBlockIndex,
-                          delta: delta.content,
-                          partial: output,
-                        });
-                      }
-                    }
+                    // 2. Text content and Qoder's XML/DSML tool-call fallback
+                    if (delta.content) dsmlParser.push(delta.content);
 
                     // 3. Tool calls
                     if (Array.isArray(delta.tool_calls)) {
@@ -807,16 +1007,33 @@ export function streamQoder(
               // Qoder may keep the HTTP/SSE connection alive after its protocol-level
               // completion marker. Stop consuming immediately instead of waiting for
               // the transport EOF, which can leave pi stuck in the active turn.
-              void reader.cancel().catch(() => {});
+              logStreamDebug("terminal", {
+                requestId,
+                reason: protocolDone ? "protocol-done" : "finish-reason",
+                elapsedMs: Date.now() - attemptStartedAt,
+                readCount,
+                totalReadBytes,
+                sseEventCount,
+              });
+              void reader.cancel().catch(() => { });
               innerController.abort();
               break;
             }
 
             if (transportDone) {
+              logStreamDebug("transport-end-without-terminal", {
+                requestId,
+                elapsedMs: Date.now() - attemptStartedAt,
+                readCount,
+                totalReadBytes,
+                sseEventCount,
+                bufferedChars: buffer.length,
+              });
               throw new Error("Qoder stream ended before a terminal response event");
             }
           }
 
+          dsmlParser.finish();
           if (thinkingParser) thinkingParser.finalize();
 
           if (thinkingBlockIndex !== -1) {
@@ -869,6 +1086,16 @@ export function streamQoder(
             output.stopReason = "toolUse";
           }
 
+          logStreamDebug("done", {
+            requestId,
+            reason: output.stopReason,
+            elapsedMs: Date.now() - attemptStartedAt,
+            readCount,
+            totalReadBytes,
+            sseEventCount,
+            contentBlocks: output.content.length,
+            usage: output.usage,
+          });
           stream.push({
             type: "done",
             reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
@@ -876,15 +1103,33 @@ export function streamQoder(
           });
           stream.end();
         } catch (error) {
+          logStreamDebug("attempt-error", {
+            requestId,
+            error: describeError(error),
+            errorDetails: describeErrorDetails(error),
+            streamTimedOut,
+            elapsedMs: Date.now() - attemptStartedAt,
+            readCount,
+            totalReadBytes,
+            sseEventCount,
+          });
           if (streamTimedOut) {
             throw new Error("Qoder stream timeout: no terminal response was received");
           }
           throw error;
         } finally {
+          logStreamDebug("attempt-finally", {
+            requestId,
+            elapsedMs: Date.now() - attemptStartedAt,
+            readCount,
+            totalReadBytes,
+            sseEventCount,
+            aborted: innerController.signal.aborted,
+          });
           if (streamTimeoutTimer !== undefined) clearTimeout(streamTimeoutTimer);
           // Always release the response body, including parse/upstream errors and
           // queue retries, so a half-closed proxy connection cannot leak.
-          void reader?.cancel().catch(() => {});
+          void reader?.cancel().catch(() => { });
           innerController.abort();
           options?.signal?.removeEventListener("abort", onExternalAbort);
         }
@@ -925,12 +1170,18 @@ export function streamQoder(
         }
       }
     } catch (e: unknown) {
+      logStreamDebug("turn-error", {
+        error: describeError(e),
+        errorDetails: describeErrorDetails(e),
+        aborted: options?.signal?.aborted ?? false,
+        contentBlocks: output.content.length,
+      });
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = e instanceof Error ? e.message : String(e);
       stream.push({ type: "error", reason: output.stopReason, error: output });
       try {
         stream.end();
-      } catch {}
+      } catch { }
     }
   })();
 

@@ -485,6 +485,27 @@ describe("streamQoder", () => {
     expect(toolCall).toBeDefined();
   });
 
+  it("converts Qoder's DSML tool-call text into a tool call", async () => {
+    const dsml =
+      '<invoke name="ask_user"><parameter name="remark">Need &lt;help&gt;</parameter><parameter name="options" string="false">[{"title":"Yes"}]</parameter></invoke>';
+    const sse =
+      sseEnvelope(chunk({ content: "before<inv" })) +
+      sseEnvelope(chunk({ content: `${dsml.slice("<inv".length)}after` })) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const done = events.find((e) => e.type === "done");
+    const msg = (done as { message: AssistantMessage }).message;
+    const toolCall = msg.content.find((content) => content.type === "toolCall") as ToolCall | undefined;
+    const text = msg.content.find((content) => content.type === "text") as { text: string } | undefined;
+    expect(text?.text).toBe("beforeafter");
+    expect(toolCall?.name).toBe("ask_user");
+    expect(toolCall?.arguments).toEqual({ remark: "Need <help>", options: [{ title: "Yes" }] });
+    expect(msg.stopReason).toBe("toolUse");
+  });
+
   it("emits a tool call that arrives with no arguments", async () => {
     // A no-argument tool: the block used to be created only when arguments were
     // present, so the finalizer claimed toolUse on a message with no tool call,

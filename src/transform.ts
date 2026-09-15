@@ -8,6 +8,7 @@ import type {
   ToolCall,
   ToolResultMessage,
 } from "@earendil-works/pi-ai";
+import { logDebug } from "./debug-log.js";
 
 // OpenAI-shaped schema for the Qoder gateway.
 
@@ -195,8 +196,9 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
     if (answered.length === m.tool_calls.length) continue;
     if (answered.length > 0) {
       if (process.env.QODER_DEBUG) {
-        console.warn(
-          `[pi-provider-qoder] dropped ${m.tool_calls.length - answered.length} unanswered tool call(s) from assistant message`,
+        logDebug(
+          "transform",
+          `dropped ${m.tool_calls.length - answered.length} unanswered tool call(s) from assistant message`,
         );
       }
       m.tool_calls = answered;
@@ -205,7 +207,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
     const content = typeof m.content === "string" ? m.content : "";
     if (content.trim() === "") {
       if (process.env.QODER_DEBUG) {
-        console.warn("[pi-provider-qoder] dropped assistant message with unanswered tool calls (interrupted turn)");
+        logDebug("transform", "dropped assistant message with unanswered tool calls (interrupted turn)");
       }
       normalizedMessages.splice(i, 1);
       i--;

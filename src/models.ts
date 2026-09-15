@@ -11,6 +11,7 @@ import {
   logCosyRequest,
   logCosyResponse,
 } from "./cosy.js";
+import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
 import { withQoderHttpTimeout } from "./http.js";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
@@ -610,6 +611,8 @@ export async function updateQoderModelsCache(
   mode: string = getQoderMode(),
 ): Promise<void> {
   const modelListURL = getQoderModelListURL(mode);
+  const startedAt = Date.now();
+  if (isQoderDebugEnabled()) logDebug("models", { event: "request", mode, url: modelListURL });
   try {
     const headers = buildAuthHeaders(null, modelListURL, { userID, authToken, name, email });
     logCosyRequest("GET", modelListURL, headers);
@@ -621,6 +624,14 @@ export async function updateQoderModelsCache(
         signal,
       });
       await logCosyResponse(modelListURL, response);
+      if (isQoderDebugEnabled()) {
+        logDebug("models", {
+          event: "response",
+          mode,
+          status: response.status,
+          elapsedMs: Date.now() - startedAt,
+        });
+      }
       if (!response.ok) return null;
       return (await response.json()) as { chat?: QoderModelEntry[] };
     });
@@ -697,5 +708,22 @@ export async function updateQoderModelsCache(
     const cachePath = getQoderCachePath(mode);
     mkdirSync(dirname(cachePath), { recursive: true });
     writeFileSync(cachePath, JSON.stringify(cacheData, null, 2), "utf-8");
-  } catch {}
+    if (isQoderDebugEnabled()) {
+      logDebug("models", {
+        event: "cache-updated",
+        mode,
+        modelCount: newModels.length,
+        elapsedMs: Date.now() - startedAt,
+      });
+    }
+  } catch (error) {
+    if (isQoderDebugEnabled()) {
+      logDebug("models", {
+        event: "error",
+        mode,
+        elapsedMs: Date.now() - startedAt,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 }

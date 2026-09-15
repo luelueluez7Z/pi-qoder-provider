@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
 
 // ---------------------------------------------------------------------------
 // Qoder API identity + signing primitives.
@@ -125,13 +126,13 @@ function parseQoderVPCInstance(value?: string): string | undefined {
 function getQoderVPCInstance(endpointOverride?: string): string | undefined {
   return parseQoderVPCInstance(
     endpointOverride ||
-      process.env.QODER_VPC_INSTANCE ||
-      process.env.QODER_VPC_ENDPOINT ||
-      process.env.QODERCN_VPC_ENDPOINT ||
-      process.env.QODERCN_CLI_VPC_ENDPOINT ||
-      process.env.QODER_CN_BASE_URL ||
-      process.env.QODER_CN_OPENAPI_URL ||
-      process.env.QODER_CN_CENTER_URL,
+    process.env.QODER_VPC_INSTANCE ||
+    process.env.QODER_VPC_ENDPOINT ||
+    process.env.QODERCN_VPC_ENDPOINT ||
+    process.env.QODERCN_CLI_VPC_ENDPOINT ||
+    process.env.QODER_CN_BASE_URL ||
+    process.env.QODER_CN_OPENAPI_URL ||
+    process.env.QODER_CN_CENTER_URL,
   );
 }
 
@@ -393,7 +394,7 @@ export function getMachineId(): string {
       try {
         const val = readFileSync(p, "utf8").trim();
         if (val) return val;
-      } catch {}
+      } catch { }
     }
   }
   const newId = crypto.randomUUID();
@@ -401,7 +402,7 @@ export function getMachineId(): string {
     const savePath = paths[1];
     mkdirSync(dirname(savePath), { recursive: true });
     writeFileSync(savePath, newId, "utf8");
-  } catch {}
+  } catch { }
   return newId;
 }
 
@@ -486,9 +487,10 @@ function isCosyDebugEnabled(): boolean {
 }
 
 export function logCosyRequest(method: string, requestURL: string, headers: Record<string, string>): void {
-  if (!isCosyDebugEnabled()) return;
-  console.error(
-    `[qoder:cosy] request ${JSON.stringify({
+  if (!isCosyDebugEnabled() && !isQoderDebugEnabled()) return;
+  logDebug(
+    "cosy",
+    `request ${JSON.stringify({
       method,
       url: requestURL,
       cosyDate: headers["Cosy-Date"],
@@ -500,7 +502,7 @@ export function logCosyRequest(method: string, requestURL: string, headers: Reco
 }
 
 export async function logCosyResponse(requestURL: string, response: Response): Promise<void> {
-  if (!isCosyDebugEnabled()) return;
+  if (!isCosyDebugEnabled() && !isQoderDebugEnabled()) return;
   let bodyPreview: string | undefined;
   if (!response.ok) {
     try {
@@ -509,8 +511,9 @@ export async function logCosyResponse(requestURL: string, response: Response): P
       bodyPreview = "<unavailable>";
     }
   }
-  console.error(
-    `[qoder:cosy] response ${JSON.stringify({
+  logDebug(
+    "cosy",
+    `response ${JSON.stringify({
       url: requestURL,
       status: response.status,
       statusText: response.statusText,
@@ -607,7 +610,7 @@ export function parseQoderUpstreamError(body: string): QoderUpstreamErrorInfo | 
     let inner: Record<string, unknown> | null = null;
     try {
       inner = typeof outer.message === "string" ? (JSON.parse(outer.message) as Record<string, unknown>) : null;
-    } catch {}
+    } catch { }
 
     const finalCode = inner && typeof inner.code === "string" ? inner.code : code;
     if (inner && typeof inner.message === "string") {
@@ -619,7 +622,7 @@ export function parseQoderUpstreamError(body: string): QoderUpstreamErrorInfo | 
         ) {
           return { code: finalCode, message: inner.message, queue };
         }
-      } catch {}
+      } catch { }
     }
 
     const fallbackMessage = typeof outer.message === "string" ? outer.message : undefined;
