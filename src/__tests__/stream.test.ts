@@ -3,10 +3,11 @@ import type {
   AssistantMessage,
   AssistantMessageEvent,
   AssistantMessageEventStream,
-  Context,
   Model,
   ToolCall,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamQoder } from "../stream.js";
 import { resetQoderQuotaCache } from "../usage.js";
@@ -194,12 +195,12 @@ function makeModel(): Model<Api> {
   return { id: "ultimate", api: "qoder-api" as Api, provider: "qoder", contextWindow: 1000000 } as Model<Api>;
 }
 
-function makeContext(): Context {
-  return {
+function makeContext(): TranscriptContext {
+  return normalizeContext({
     systemPrompt: "test",
-    messages: [{ role: "user", content: "hi" }],
+    messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
     tools: [],
-  } as unknown as Context;
+  });
 }
 
 async function consume(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {

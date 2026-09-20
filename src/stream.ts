@@ -6,13 +6,14 @@ import type {
   Api,
   AssistantMessage,
   AssistantMessageEventStream,
-  Context,
   Model,
   SimpleStreamOptions,
   TextContent,
   ThinkingContent,
   ToolCall,
+  TranscriptContext,
 } from "@earendil-works/pi-ai";
+import { collapseSystemMessages, getCurrentSystemPrompt, getCurrentTools, withoutInitialSystemMessage } from "@earendil-works/pi-ai";
 import * as PiAi from "@earendil-works/pi-ai";
 import {
   buildAuthHeaders,
@@ -31,7 +32,7 @@ import {
   QoderQueueError,
 } from "./cosy.js";
 import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
-import { DsmlToolParser } from "./dsml.js";
+import { DsmlToolParser, type DsmlToolCall } from "./dsml.js";
 import { withQoderHttpTimeout } from "./http.js";
 import { getCachedModelConfig } from "./models.js";
 import { resolveQoderIdentity } from "./oauth.js";
@@ -218,7 +219,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 export function streamQoder(
   model: Model<Api>,
-  context: Context,
+  context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
   const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
@@ -292,8 +293,16 @@ export function streamQoder(
       const isReasoning = !!modelConfig.is_reasoning;
       const maxOutputTokens = modelConfig.max_output_tokens || 32768;
 
-      const normalizedMessages = transformMessagesForQoder(context.messages);
-      const systemText = context.systemPrompt || "";
+      // pi 0.86.0: streamSimple now receives a normalized TranscriptContext.
+      // The system prompt and tool declarations live in system messages; replay
+      // them (folding mid-conversation system messages into the leading one,
+      // since Qoder carries the prompt as a single leading system message) and
+      // drop the leading system message before transforming the chat messages.
+      const collapsed = collapseSystemMessages(context);
+      const systemText = getCurrentSystemPrompt(collapsed.messages);
+      const normalizedMessages = transformMessagesForQoder(
+        withoutInitialSystemMessage(collapsed.messages),
+      );
 
       let lastUserText = "";
       for (let i = normalizedMessages.length - 1; i >= 0; i--) {
@@ -331,7 +340,8 @@ export function streamQoder(
       // (model.contextWindow or model.preferences.<qoderModel>.contextWindow).
       const contextWindow = resolveQoderContextWindow(qoderModel) ?? undefined;
 
-      const toolsRaw = context.tools && context.tools.length > 0 ? transformTools(context.tools) : undefined;
+      const currentTools = getCurrentTools(collapsed.messages);
+      const toolsRaw = currentTools.length > 0 ? transformTools(currentTools) : undefined;
       const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
 
       // Queue-aware auto retry: when the upstream answers with a 10605 "model
@@ -568,7 +578,24 @@ export function streamQoder(
             });
           };
 
-          const dsmlParser = new DsmlToolParser(appendText, ({ name, arguments: args }) => {
+          const appendThinking = (text: string) => {
+            if (!text) return;
+            if (thinkingBlockIndex === -1) {
+              thinkingBlockIndex = output.content.length;
+              output.content.push({ type: "thinking", thinking: "" });
+              stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
+            }
+            const block = output.content[thinkingBlockIndex] as ThinkingContent;
+            block.thinking += text;
+            stream.push({
+              type: "thinking_delta",
+              contentIndex: thinkingBlockIndex,
+              delta: text,
+              partial: output,
+            });
+          };
+
+          const emitDsmlTool = ({ name, arguments: args }: DsmlToolCall) => {
             logStreamDebug("dsml-tool-call", {
               requestId,
               name,
@@ -586,7 +613,7 @@ export function streamQoder(
               type: "toolCall",
               id,
               name,
-              arguments: args,
+              arguments: args as ToolCall["arguments"],
             } satisfies ToolCall);
             stream.push({ type: "toolcall_start", contentIndex, partial: output });
             if (serializedArguments !== "{}") {
@@ -600,7 +627,7 @@ export function streamQoder(
             stream.push({
               type: "toolcall_end",
               contentIndex,
-              toolCall: { type: "toolCall", id, name, arguments: args },
+              toolCall: { type: "toolCall", id, name, arguments: args as ToolCall["arguments"] },
               partial: output,
             });
             toolCallsState[index] = {
@@ -611,6 +638,14 @@ export function streamQoder(
               emittedEnd: true,
               contentIndex,
             };
+          };
+
+          const dsmlParser = new DsmlToolParser(appendText, emitDsmlTool);
+          // The reasoning channel only ever carries *degenerate* DSML (the
+          // opener got stripped upstream); a complete `<invoke>` draft there is
+          // just the model thinking out loud and must stay thinking text.
+          const dsmlReasoningParser = new DsmlToolParser(appendThinking, emitDsmlTool, {
+            incompleteOnly: true,
           });
 
           while (true) {
@@ -863,26 +898,28 @@ export function streamQoder(
                     }
                     // 1. Reasoning/thinking content (API reasoning channel)
                     if (delta.reasoning_content) {
-                      const reasoningChunk = stripThinkingTags(delta.reasoning_content);
-                      if (reasoningChunk) {
-                        if (thinkingBlockIndex === -1) {
-                          thinkingBlockIndex = output.content.length;
-                          output.content.push({ type: "thinking", thinking: "" });
-                          stream.push({ type: "thinking_start", contentIndex: thinkingBlockIndex, partial: output });
-                        }
-                        const block = output.content[thinkingBlockIndex] as ThinkingContent;
-                        block.thinking += reasoningChunk;
-                        stream.push({
-                          type: "thinking_delta",
-                          contentIndex: thinkingBlockIndex,
-                          delta: reasoningChunk,
-                          partial: output,
+                      if (/<invoke|<parameter|<calls>|&lt;|\uFF5C|tool▁/i.test(delta.reasoning_content)) {
+                        logStreamDebug("dsml-raw-reasoning", {
+                          requestId,
+                          eventNo: sseEventCount,
+                          content: delta.reasoning_content.slice(0, 600),
                         });
                       }
-                    }
+        const reasoningChunk = stripThinkingTags(delta.reasoning_content);
+        if (reasoningChunk) dsmlReasoningParser.push(reasoningChunk);
+      }
 
                     // 2. Text content and Qoder's XML/DSML tool-call fallback
-                    if (delta.content) dsmlParser.push(delta.content);
+                    if (delta.content) {
+                      if (/<invoke|<parameter|<calls>|&lt;|\uFF5C|tool▁/i.test(delta.content)) {
+                        logStreamDebug("dsml-raw", {
+                          requestId,
+                          eventNo: sseEventCount,
+                          content: delta.content.slice(0, 600),
+                        });
+                      }
+                      dsmlParser.push(delta.content);
+                    }
 
                     // 3. Tool calls
                     if (Array.isArray(delta.tool_calls)) {
@@ -1033,8 +1070,9 @@ export function streamQoder(
             }
           }
 
-          dsmlParser.finish();
-          if (thinkingParser) thinkingParser.finalize();
+        dsmlParser.finish();
+        dsmlReasoningParser.finish();
+        if (thinkingParser) thinkingParser.finalize();
 
           if (thinkingBlockIndex !== -1) {
             const block = output.content[thinkingBlockIndex] as ThinkingContent;
@@ -1059,7 +1097,7 @@ export function streamQoder(
                 args = parsedArguments;
               }
               const block = output.content[state.contentIndex] as ToolCall;
-              block.arguments = args;
+              block.arguments = args as ToolCall["arguments"];
               stream.push({
                 type: "toolcall_end",
                 contentIndex: state.contentIndex,
@@ -1067,7 +1105,7 @@ export function streamQoder(
                   type: "toolCall",
                   id: state.id,
                   name: state.name,
-                  arguments: args,
+                  arguments: args as ToolCall["arguments"],
                 },
                 partial: output,
               });
