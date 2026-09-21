@@ -275,10 +275,16 @@ export function streamQoder(
         throw new Error(quotaCheck.message || "Qoder 积分额度已用完，请升级套餐或充值后重试。");
       }
 
-      const qoderModel = isQoderCNMode(providerMode)
+      const aliasKey = isQoderCNMode(providerMode)
         ? getQoderCNDirectModel(model.id)
         : getQoderGlobalDirectModel(model.id);
-      const modelConfig = getCachedModelConfig(qoderModel, providerMode) || {
+      const cachedConfig =
+        getCachedModelConfig(model.id, providerMode) || getCachedModelConfig(aliasKey, providerMode);
+      // Prefer the live catalog wire key over the static alias table: when
+      // Qoder rotates a model's key, the friendly-id cache entry still points
+      // at the current key while the hardcoded alias goes stale.
+      const qoderModel = cachedConfig?.key || aliasKey;
+      const modelConfig = cachedConfig || {
         key: qoderModel,
         is_reasoning:
           qoderModel === "ultimate" ||
