@@ -329,11 +329,14 @@ export function streamQoder(
       if (maxOutputTokens > 0) maxTokens = maxOutputTokens;
       if (options?.maxTokens && options.maxTokens < maxTokens) maxTokens = options.maxTokens;
 
-      // Map pi's thinking level to Qoder's `reasoning_effort` wire parameter.
-      // pi levels: off/minimal/low/medium/high/xhigh/max. Qoder accepts:
-      // none/low/medium/high/xhigh/max (and "none" when thinking is off).
+      // Map pi's thinking level to Qoder's wire parameters. qodercli sends
+      // `reasoning_effort` and `enable_thinking` as a pair: effort carries the
+      // level (none/low/medium/high/xhigh/max) and the boolean is the on/off
+      // switch — off must send enable_thinking:false explicitly, otherwise the
+      // upstream applies its own default.
       const reasoningLevel = (options?.reasoning as string | undefined) ?? "off";
       const reasoningEffort = reasoningLevel === "off" || reasoningLevel === "minimal" ? "none" : reasoningLevel;
+      const enableThinking = reasoningEffort !== "none";
 
       // Context window: pi's streamSimple has no contextWindow option, so honor
       // the user's Qoder CLI preference from ~/.qoder/settings.json
@@ -407,11 +410,12 @@ export function streamQoder(
               ? [{ role: "system", content: systemText }, ...normalizedMessages]
               : normalizedMessages,
             tools: toolsRaw || [],
-            parameters: {
-              max_tokens: maxTokens,
-              ...(reasoningEffort !== "none" ? { reasoning_effort: reasoningEffort } : { reasoning_effort: "none" }),
-              ...(contextWindow ? { context_window: contextWindow } : {}),
-            },
+        parameters: {
+          max_tokens: maxTokens,
+          reasoning_effort: reasoningEffort,
+          enable_thinking: enableThinking,
+          ...(contextWindow ? { context_window: contextWindow } : {}),
+        },
             chat_context: {
               chatPrompt: "",
               imageUrls: null,
