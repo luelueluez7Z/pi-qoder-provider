@@ -25,7 +25,7 @@ XcW+ML9FoCI6AOvOzwIDAQAB
 
 // Client identity constants. Out-of-date values cause the model endpoint to
 // return a reduced catalog, so keep these aligned with the current Qoder CLI.
-const IDE_VERSION = "1.1.3";
+const IDE_VERSION = "1.1.38";
 const CLIENT_TYPE = "5";
 const DATA_POLICY = "disagree";
 const LOGIN_VERSION = "v2";
