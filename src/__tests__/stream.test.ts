@@ -8,7 +8,7 @@ import type {
   TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { streamQoder } from "../stream.js";
 import { resetQoderQuotaCache } from "../usage.js";
 
@@ -214,8 +214,14 @@ async function consume(stream: AssistantMessageEventStream): Promise<AssistantMe
 
 describe("streamQoder", () => {
   const originalFetch = globalThis.fetch;
+  beforeEach(() => {
+    // This suite covers the legacy COSY transport. The qodercli model-server
+    // transport (QODER_PROTOCOL=v2|auto) is covered by model-server.test.ts.
+    process.env.QODER_PROTOCOL = "legacy";
+  });
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    delete process.env.QODER_PROTOCOL;
     delete process.env.QODER_QUEUE_RETRY_MAX;
     delete process.env.QODER_IDLE_TIMEOUT_MS;
     delete process.env.QODER_STREAM_TIMEOUT_MS;

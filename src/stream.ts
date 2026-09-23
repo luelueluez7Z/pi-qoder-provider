@@ -1,7 +1,4 @@
 import crypto from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type {
   Api,
   AssistantMessage,
@@ -13,33 +10,24 @@ import type {
   ToolCall,
   TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { collapseSystemMessages, getCurrentSystemPrompt, getCurrentTools, withoutInitialSystemMessage } from "@earendil-works/pi-ai";
 import * as PiAi from "@earendil-works/pi-ai";
 import {
   buildAuthHeaders,
   createQoderQueueError,
   formatQoderHttpError,
   formatQoderUpstreamError,
-  getMachineId,
   getQoderChatURL,
-  getQoderCNDirectModel,
-  getQoderGlobalDirectModel,
-  getQoderMode,
-  getQoderUserEmailFallback,
-  isQoderCNMode,
   logCosyRequest,
   logCosyResponse,
   QoderQueueError,
 } from "./cosy.js";
 import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
-import { DsmlToolParser, type DsmlToolCall } from "./dsml.js";
+import { type DsmlToolCall, DsmlToolParser } from "./dsml.js";
 import { withQoderHttpTimeout } from "./http.js";
-import { getCachedModelConfig } from "./models.js";
-import { resolveQoderIdentity } from "./oauth.js";
+import { runModelServerTurn, useQoderModelServer } from "./model-server.js";
+import { prepareQoderRequest } from "./prepare.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
-import { transformMessagesForQoder, transformTools } from "./transform.js";
-import { checkQoderQuota } from "./usage.js";
 
 interface ToolCallState {
   arguments: string;
@@ -88,16 +76,6 @@ function describeErrorDetails(error: unknown): Record<string, unknown> {
   return details;
 }
 
-function stableHash(prefix: string, ...inputs: string[]): string {
-  const hash = crypto.createHash("sha256");
-  hash.update(prefix);
-  for (const input of inputs) {
-    hash.update("\0");
-    hash.update(input);
-  }
-  return hash.digest("hex").slice(0, 16);
-}
-
 function stableChatRecordID(
   model: string,
   messages: Array<{ role?: string; content?: unknown }>,
@@ -125,34 +103,6 @@ function stableChatRecordID(
   hash.update("\0");
   hash.update(`mt=${maxTokens}`);
   return hash.digest("hex").slice(0, 16);
-}
-
-/**
- * Resolve the user's context window preference for a model from Qoder's own
- * settings file (~/.qoder/settings.json). This honors what the user chose via
- * `/context-window` in qodercli:
- *   - model.contextWindow                      (global default)
- *   - model.preferences.<qoderModel>.contextWindow  (per-model override)
- * Returns undefined when unset / unreadable, so the gateway applies its default.
- */
-function resolveQoderContextWindow(qoderModel: string): number | undefined {
-  try {
-    const settingsPath = join(homedir(), ".qoder", "settings.json");
-    if (!existsSync(settingsPath)) return undefined;
-    const settings = JSON.parse(readFileSync(settingsPath, "utf8")) as {
-      model?: {
-        contextWindow?: unknown;
-        preferences?: Record<string, { contextWindow?: unknown }>;
-      };
-    };
-    const perModel = settings.model?.preferences?.[qoderModel]?.contextWindow;
-    if (typeof perModel === "number" && perModel > 0) return perModel;
-    const global = settings.model?.contextWindow;
-    if (typeof global === "number" && global > 0) return global;
-    return undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 /**
@@ -246,111 +196,34 @@ export function streamQoder(
 
   (async () => {
     try {
-      const providerMode = model.provider === "qoder-cn" ? "cn" : getQoderMode();
-      const accessToken = options?.apiKey;
-      if (!accessToken) {
-        throw new Error(
-          isQoderCNMode(providerMode)
-            ? "Qoder CN credentials not set. Run /login qoder-cn or set QODERCN_PERSONAL_ACCESS_TOKEN."
-            : "Qoder credentials not set. Run /login qoder or set QODER_PERSONAL_ACCESS_TOKEN.",
-        );
-      }
-
-      // Resolve identity: auth.json fast path → in-process cache → /userinfo(access).
-      // Cold start only has options.apiKey (access); do NOT decode refresh here.
-      // Never invent a placeholder userID — the gateway returns opaque HTTP 500.
-      const identity = await resolveQoderIdentity(accessToken, model.provider, providerMode, options?.signal);
-      const userID = identity.userID;
-      const name = identity.name || (isQoderCNMode(providerMode) ? "Qoder CN User" : "Qoder User");
-      const email = identity.email || getQoderUserEmailFallback(providerMode);
-      const machineID = identity.machineID || getMachineId();
-
-      // Pre-flight quota check: when the account is out of credits, the
-      // upstream answers the chat endpoint with HTTP 200 but never streams —
-      // the turn would hang with no output. Detect it up front and fail fast
-      // with a friendly message instead. The check is cached for 60s so normal
-      // usage doesn't pay an extra round-trip on every turn.
-      const quotaCheck = await checkQoderQuota(accessToken, providerMode, options?.signal);
-      if (quotaCheck.exhausted) {
-        throw new Error(quotaCheck.message || "Qoder 积分额度已用完，请升级套餐或充值后重试。");
-      }
-
-      const aliasKey = isQoderCNMode(providerMode)
-        ? getQoderCNDirectModel(model.id)
-        : getQoderGlobalDirectModel(model.id);
-      const cachedConfig =
-        getCachedModelConfig(model.id, providerMode) || getCachedModelConfig(aliasKey, providerMode);
-      // Prefer the live catalog wire key over the static alias table: when
-      // Qoder rotates a model's key, the friendly-id cache entry still points
-      // at the current key while the hardcoded alias goes stale.
-      const qoderModel = cachedConfig?.key || aliasKey;
-      const modelConfig = cachedConfig || {
-        key: qoderModel,
-        is_reasoning:
-          qoderModel === "ultimate" ||
-          qoderModel === "performance" ||
-          qoderModel.includes("dmodel") ||
-          qoderModel.includes("dfmodel"),
-        max_output_tokens: 32768,
-        source: "system",
-      };
-      modelConfig.key = qoderModel;
-
-      const isReasoning = !!modelConfig.is_reasoning;
-      const maxOutputTokens = modelConfig.max_output_tokens || 32768;
-
-      // pi 0.86.0: streamSimple now receives a normalized TranscriptContext.
-      // The system prompt and tool declarations live in system messages; replay
-      // them (folding mid-conversation system messages into the leading one,
-      // since Qoder carries the prompt as a single leading system message) and
-      // drop the leading system message before transforming the chat messages.
-      const collapsed = collapseSystemMessages(context);
-      const systemText = getCurrentSystemPrompt(collapsed.messages);
-      const normalizedMessages = transformMessagesForQoder(
-        withoutInitialSystemMessage(collapsed.messages),
-      );
-
-      let lastUserText = "";
-      for (let i = normalizedMessages.length - 1; i >= 0; i--) {
-        if (normalizedMessages[i].role === "user") {
-          const content = normalizedMessages[i].content;
-          lastUserText =
-            typeof content === "string"
-              ? content
-              : Array.isArray(content)
-                ? content.map((c) => ("text" in c ? c.text : "")).join("")
-                : "";
-          break;
-        }
-      }
-
-      // Use a stable session id when pi provides one (per agent session) so the
-      // Qoder server can maintain prompt cache affinity across requests.
-      const stablePart = stableHash("qoder-session", userID, qoderModel);
-      const sessionID = options?.sessionId
-        ? `${stablePart}-${options.sessionId}`
-        : `${stablePart}-${crypto.randomUUID()}`;
-
-      let maxTokens = 32768;
-      if (maxOutputTokens > 0) maxTokens = maxOutputTokens;
-      if (options?.maxTokens && options.maxTokens < maxTokens) maxTokens = options.maxTokens;
-
-      // Map pi's thinking level to Qoder's wire parameters. qodercli sends
-      // `reasoning_effort` and `enable_thinking` as a pair: effort carries the
-      // level (none/low/medium/high/xhigh/max) and the boolean is the on/off
-      // switch — off must send enable_thinking:false explicitly, otherwise the
-      // upstream applies its own default.
-      const reasoningLevel = (options?.reasoning as string | undefined) ?? "off";
-      const reasoningEffort = reasoningLevel === "off" || reasoningLevel === "minimal" ? "none" : reasoningLevel;
-      const enableThinking = reasoningEffort !== "none";
+      // Shared prelude (identity, quota, model key, replayed messages, tools,
+      // generation parameters) — used by both the legacy COSY transport and the
+      // qodercli model-server transport.
+      const prepared = await prepareQoderRequest(model, context, options);
+      const {
+        providerMode,
+        accessToken,
+        userID,
+        name,
+        email,
+        machineID,
+        qoderModel,
+        modelConfig,
+        isReasoning,
+        systemText,
+        normalizedMessages,
+        lastUserText,
+        sessionID,
+        maxTokens,
+        reasoningEffort,
+        enableThinking,
+        contextWindow,
+        toolsRaw,
+      } = prepared;
 
       // Context window: pi's streamSimple has no contextWindow option, so honor
       // the user's Qoder CLI preference from ~/.qoder/settings.json
       // (model.contextWindow or model.preferences.<qoderModel>.contextWindow).
-      const contextWindow = resolveQoderContextWindow(qoderModel) ?? undefined;
-
-      const currentTools = getCurrentTools(collapsed.messages);
-      const toolsRaw = currentTools.length > 0 ? transformTools(currentTools) : undefined;
       const recordID = stableChatRecordID(qoderModel, normalizedMessages, toolsRaw, maxTokens);
 
       // Queue-aware auto retry: when the upstream answers with a 10605 "model
@@ -362,6 +235,14 @@ export function streamQoder(
       let queueNoticeIndex: number | null = null;
 
       stream.push({ type: "start", partial: output });
+
+      // qodercli's model-server transport (QODER_PROTOCOL=auto|v2) is a plain
+      // OpenAI-compatible SSE stream: no request signing, no response envelope
+      // and native tool_calls instead of DSML XML in the text channel.
+      if (useQoderModelServer(providerMode, qoderModel)) {
+        await runModelServerTurn({ prepared, options, output, stream });
+        return;
+      }
 
       const attemptOnce = async (): Promise<void> => {
         // Inner AbortController so both the caller's signal and an idle timeout
@@ -383,7 +264,7 @@ export function streamQoder(
             sseEventCount,
           });
           innerController.abort();
-          void reader?.cancel().catch(() => { });
+          void reader?.cancel().catch(() => {});
         };
         let streamTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
         let streamTimedOut = false;
@@ -416,12 +297,12 @@ export function streamQoder(
               ? [{ role: "system", content: systemText }, ...normalizedMessages]
               : normalizedMessages,
             tools: toolsRaw || [],
-        parameters: {
-          max_tokens: maxTokens,
-          reasoning_effort: reasoningEffort,
-          enable_thinking: enableThinking,
-          ...(contextWindow ? { context_window: contextWindow } : {}),
-        },
+            parameters: {
+              max_tokens: maxTokens,
+              reasoning_effort: reasoningEffort,
+              enable_thinking: enableThinking,
+              ...(contextWindow ? { context_window: contextWindow } : {}),
+            },
             chat_context: {
               chatPrompt: "",
               imageUrls: null,
@@ -532,7 +413,7 @@ export function streamQoder(
                 sseEventCount,
               });
               innerController.abort();
-              void reader?.cancel().catch(() => { });
+              void reader?.cancel().catch(() => {});
             }, streamTimeoutMs);
           }
           const decoder = new TextDecoder();
@@ -684,7 +565,7 @@ export function streamQoder(
               });
               const readPromise = reader.read();
               // Ignore the late rejection once the idle abort tears the fetch down.
-              readPromise.catch(() => { });
+              readPromise.catch(() => {});
               try {
                 ({ done, value } = await Promise.race([readPromise, idle]));
               } finally {
@@ -874,7 +755,8 @@ export function streamQoder(
                 if (inner.choices !== undefined && !Array.isArray(inner.choices)) {
                   throw new Error("Qoder SSE payload has invalid choices");
                 }
-                const firstChoice = Array.isArray(inner.choices) && isRecord(inner.choices[0]) ? inner.choices[0] : undefined;
+                const firstChoice =
+                  Array.isArray(inner.choices) && isRecord(inner.choices[0]) ? inner.choices[0] : undefined;
                 const firstDelta = firstChoice && isRecord(firstChoice.delta) ? firstChoice.delta : undefined;
                 logStreamDebug("event", {
                   requestId,
@@ -915,9 +797,9 @@ export function streamQoder(
                           content: delta.reasoning_content.slice(0, 600),
                         });
                       }
-        const reasoningChunk = stripThinkingTags(delta.reasoning_content);
-        if (reasoningChunk) dsmlReasoningParser.push(reasoningChunk);
-      }
+                      const reasoningChunk = stripThinkingTags(delta.reasoning_content);
+                      if (reasoningChunk) dsmlReasoningParser.push(reasoningChunk);
+                    }
 
                     // 2. Text content and Qoder's XML/DSML tool-call fallback
                     if (delta.content) {
@@ -1062,7 +944,7 @@ export function streamQoder(
                 totalReadBytes,
                 sseEventCount,
               });
-              void reader.cancel().catch(() => { });
+              void reader.cancel().catch(() => {});
               innerController.abort();
               break;
             }
@@ -1080,9 +962,9 @@ export function streamQoder(
             }
           }
 
-        dsmlParser.finish();
-        dsmlReasoningParser.finish();
-        if (thinkingParser) thinkingParser.finalize();
+          dsmlParser.finish();
+          dsmlReasoningParser.finish();
+          if (thinkingParser) thinkingParser.finalize();
 
           if (thinkingBlockIndex !== -1) {
             const block = output.content[thinkingBlockIndex] as ThinkingContent;
@@ -1177,7 +1059,7 @@ export function streamQoder(
           if (streamTimeoutTimer !== undefined) clearTimeout(streamTimeoutTimer);
           // Always release the response body, including parse/upstream errors and
           // queue retries, so a half-closed proxy connection cannot leak.
-          void reader?.cancel().catch(() => { });
+          void reader?.cancel().catch(() => {});
           innerController.abort();
           options?.signal?.removeEventListener("abort", onExternalAbort);
         }
@@ -1229,7 +1111,7 @@ export function streamQoder(
       stream.push({ type: "error", reason: output.stopReason, error: output });
       try {
         stream.end();
-      } catch { }
+      } catch {}
     }
   })();
 
