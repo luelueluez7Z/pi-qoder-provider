@@ -525,15 +525,28 @@ export function qoderThinkingLevelMap(m: QoderModelDef): Record<string, string |
   return map;
 }
 
+/**
+ * Models as pi should see them: the transport clamp is applied here, at the read
+ * boundary, rather than when the cache is built. The cache is up to an hour old
+ * and the static catalogs are raw, so clamping on write would let a stale window
+ * reach pi — and would freeze the window at the model server's capacity even if
+ * the session later switched to the legacy transport.
+ */
 export function getCachedModels(mode?: string): QoderModelDef[] {
+  const providerMode = getQoderMode(mode);
+  const clamp = (m: QoderModelDef): QoderModelDef => {
+    const contextWindow = effectiveContextWindow(m.contextWindow, providerMode);
+    return contextWindow === m.contextWindow ? m : { ...m, contextWindow };
+  };
+
   const cachePath = getQoderCachePath(mode);
   if (existsSync(cachePath)) {
     try {
       const data = JSON.parse(readFileSync(cachePath, "utf8"));
-      if (data && Array.isArray(data.models)) return data.models;
+      if (data && Array.isArray(data.models)) return (data.models as QoderModelDef[]).map(clamp);
     } catch {}
   }
-  return isQoderCNMode(mode) ? staticCnModels : staticModels;
+  return (isQoderCNMode(mode) ? staticCnModels : staticModels).map(clamp);
 }
 
 export function getCachedModelConfig(modelKey: string, mode?: string): QoderModelEntry | null {
@@ -699,7 +712,8 @@ export async function updateQoderModelsCache(
         thinking,
         input: isVL ? ["text", "image"] : ["text"],
         cost: ZERO_COST,
-        contextWindow: effectiveContextWindow(ctxLen, mode),
+        // Stored raw: the transport clamp is applied by getCachedModels.
+        contextWindow: ctxLen,
         maxTokens: entry.max_output_tokens || 32768,
         ...(priceFactor !== undefined ? { priceFactor } : {}),
       });
