@@ -154,6 +154,98 @@ function modelLabel(prepared: PreparedQoderRequest): string {
   return display ? `${display}（${prepared.qoderModel}）` : prepared.qoderModel;
 }
 
+/**
+ * The model server answers `500 internal server error` (no proper 413) for
+ * request bodies above ~256 KiB — measured 2026-09: 245 KB passes, 260 KB fails,
+ * reproducibly, for every model. A long pi session replays its whole history, so
+ * once that history passes the limit every turn fails; the body is therefore
+ * trimmed to fit.
+ */
+export const MAX_MODEL_SERVER_BODY_BYTES = 256 * 1024;
+/** Leave room for headers and JSON escaping drift above the measured limit. */
+const BODY_BUDGET_BYTES = MAX_MODEL_SERVER_BODY_BYTES - 4 * 1024;
+
+/** Truncation marker appended to content clipped by the body budget. */
+const CLIP_SUFFIX = "\n…（内容过长，已截断）";
+
+export interface FitBodyResult {
+  body: Record<string, unknown>;
+  /** Messages dropped from the front of the replay (0 when it already fit). */
+  droppedMessages: number;
+  /** Messages whose content was clipped to fit (0 in the normal case). */
+  clippedMessages: number;
+}
+
+/** Serialized size the server sees, with no multi-byte surprises. */
+function bodySize(body: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify(body));
+}
+
+function clipContent(message: Record<string, unknown>, limit: number): Record<string, unknown> {
+  const content = message.content;
+  if (typeof content === "string") {
+    if (content.length <= limit) return message;
+    return { ...message, content: content.slice(0, limit) + CLIP_SUFFIX };
+  }
+  if (Array.isArray(content)) {
+    return {
+      ...message,
+      content: content.map((block) => {
+        const b = block as { type?: string; text?: string };
+        if (b?.type === "text" && typeof b.text === "string" && b.text.length > limit) {
+          return { ...b, text: b.text.slice(0, limit) + CLIP_SUFFIX };
+        }
+        return block;
+      }),
+    };
+  }
+  return message;
+}
+
+/**
+ * Shrink a built request until it fits the model server's body budget.
+ *
+ * Oldest messages are dropped first, always cutting at a `user` boundary so
+ * assistant/tool_call pairs never end up orphaned (which the server rejects).
+ * If even the newest turn alone is too big its contents are clipped instead.
+ */
+export function fitBodyToBudget(body: Record<string, unknown>, budgetBytes = BODY_BUDGET_BYTES): FitBodyResult {
+  if (bodySize(body) <= budgetBytes) return { body, droppedMessages: 0, clippedMessages: 0 };
+
+  const messages = body.messages as Array<Record<string, unknown>>;
+  const hasSystem = messages[0]?.role === "system";
+  const system = hasSystem ? [messages[0]] : [];
+  const rest = messages.slice(system.length);
+
+  // Keep as much history as possible: the earliest `user` boundary that fits.
+  for (let i = 0; i < rest.length - 1; i += 1) {
+    if (rest[i].role !== "user") continue;
+    const candidate = { ...body, messages: [...system, ...rest.slice(i)] };
+    if (bodySize(candidate) <= budgetBytes) {
+      return { body: candidate, droppedMessages: i, clippedMessages: 0 };
+    }
+  }
+
+  // Even the newest turn is too big: clip contents until the budget is met.
+  let lastUser = -1;
+  for (let i = rest.length - 1; i >= 0; i -= 1) {
+    if (rest[i].role === "user") {
+      lastUser = i;
+      break;
+    }
+  }
+  const kept = rest.slice(lastUser < 0 ? rest.length - 1 : lastUser);
+  const overhead = bodySize({ ...body, messages: [...system, ...kept.map((m) => ({ ...m, content: "" }))] });
+  const perMessage = Math.max(256, Math.floor((budgetBytes - overhead) / Math.max(1, kept.length)));
+  const clipped = kept.map((m) => (m.role === "system" ? m : clipContent(m, perMessage)));
+  const candidate = { ...body, messages: [...system, ...clipped] };
+  return {
+    body: bodySize(candidate) <= budgetBytes ? candidate : { ...body, messages: [...system, ...clipped.slice(-1)] },
+    droppedMessages: rest.length - kept.length,
+    clippedMessages: clipped.filter((m, i) => m !== kept[i]).length,
+  };
+}
+
 /** Friendly Chinese hint for a model-server business error. */
 export function formatModelServerError(code: string, message: string, modelName?: string): string {
   const model = modelName || "当前模型";
@@ -261,7 +353,8 @@ export async function runModelServerTurn(args: {
   const { prepared, options, output, stream } = args;
   const requestId = crypto.randomUUID();
   const chatURL = getQoderModelServerChatURL();
-  const requestBody = buildModelServerBody(prepared, requestId);
+  const fit = fitBodyToBudget(buildModelServerBody(prepared, requestId));
+  const requestBody = fit.body;
   const bodyBytes = Buffer.from(JSON.stringify(requestBody));
 
   const innerController = new AbortController();
@@ -280,6 +373,8 @@ export async function runModelServerTurn(args: {
       catalogKey: prepared.qoderModel,
       sessionId: prepared.sessionID,
       bodyBytes: bodyBytes.byteLength,
+      droppedMessages: fit.droppedMessages,
+      clippedMessages: fit.clippedMessages,
       messageCount: (requestBody.messages as unknown[]).length,
       toolCount: Array.isArray(requestBody.tools) ? requestBody.tools.length : 0,
     });
@@ -366,6 +461,17 @@ export async function runModelServerTurn(args: {
       (output.content[textBlockIndex] as TextContent).text += text;
       stream.push({ type: "text_delta", contentIndex: textBlockIndex, delta: text, partial: output });
     };
+
+    // Tell the user when the replay had to be shrunk: the turn works, but the
+    // model no longer sees the oldest part of the session.
+    if (fit.droppedMessages > 0 || fit.clippedMessages > 0) {
+      const parts: string[] = [];
+      if (fit.droppedMessages > 0) parts.push(`省略了最早的 ${fit.droppedMessages} 条历史消息`);
+      if (fit.clippedMessages > 0) parts.push(`截断了 ${fit.clippedMessages} 条消息的内容`);
+      appendText(
+        `⚠️ 对话历史超过 Qoder 模型服务 256KB 请求上限，已${parts.join("、")}。需要完整历史时请 /compact 或新开会话。\n\n`,
+      );
+    }
 
     /** Open the block for a tool call index as soon as it is identifiable. */
     const ensureToolCall = (index: number, id: string, name: string): ToolCallState => {

@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildModelServerBody,
   canDisableThinking,
+  fitBodyToBudget,
   formatModelServerError,
   getQoderModelServerChatURL,
   isCompleteJson,
@@ -305,6 +306,69 @@ describe("canDisableThinking", () => {
     expect(canDisableThinking({ thinking_config: { disabled: { description: "Disable thinking" } } })).toBe(true);
     expect(canDisableThinking({ thinking_config: { enabled: { efforts: { high: {} } } } })).toBe(false);
     expect(canDisableThinking({})).toBe(false);
+  });
+});
+
+describe("fitBodyToBudget", () => {
+  const msg = (role: string, content: string, extra: Record<string, unknown> = {}) => ({ role, content, ...extra });
+  const size = (body: Record<string, unknown>) => Buffer.byteLength(JSON.stringify(body));
+  const orphanTools = (messages: Array<Record<string, unknown>>) => {
+    const open = new Set<string>();
+    let orphans = 0;
+    for (const m of messages) {
+      for (const tc of (m.tool_calls as Array<{ id: string }> | undefined) ?? []) open.add(tc.id);
+      if (m.role === "tool") {
+        if (open.has(String(m.tool_call_id))) open.delete(String(m.tool_call_id));
+        else orphans += 1;
+      }
+    }
+    return orphans;
+  };
+
+  it("leaves a body that fits untouched", () => {
+    const body = { model: "dfmodel", messages: [msg("system", "s"), msg("user", "hi")] };
+    const fit = fitBodyToBudget(body, 10_000);
+    expect(fit.body).toBe(body);
+    expect(fit.droppedMessages).toBe(0);
+    expect(fit.clippedMessages).toBe(0);
+  });
+
+  it("drops oldest messages at user boundaries and keeps tool pairs intact", () => {
+    const pad = "x".repeat(600);
+    const messages = [
+      msg("system", "s"),
+      msg("user", `old question ${pad}`),
+      msg("assistant", "", {
+        tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }],
+      }),
+      msg("tool", `old result ${pad}`, { tool_call_id: "c1", name: "read" }),
+      msg("assistant", `old answer ${pad}`),
+      msg("user", "newest question"),
+    ];
+    const budget = size({ ...{ model: "dfmodel" }, messages: [messages[0], msg("user", "newest question")] }) + 40;
+    const fit = fitBodyToBudget({ model: "dfmodel", messages }, budget);
+
+    expect(size(fit.body)).toBeLessThanOrEqual(budget);
+    expect(fit.droppedMessages).toBeGreaterThan(0);
+    expect(fit.clippedMessages).toBe(0);
+    const kept = fit.body.messages as Array<Record<string, unknown>>;
+    expect(kept[0].role).toBe("system");
+    expect(kept[1].role).toBe("user");
+    expect(kept.at(-1)).toMatchObject({ content: "newest question" });
+    expect(orphanTools(kept)).toBe(0);
+  });
+
+  it("clips contents when even the newest turn alone exceeds the budget", () => {
+    const body = {
+      model: "dfmodel",
+      messages: [msg("system", "s"), msg("user", "q"), msg("tool", "y".repeat(20_000), { tool_call_id: "c1" })],
+    };
+    const fit = fitBodyToBudget(body, 2_000);
+
+    expect(size(fit.body)).toBeLessThanOrEqual(2_000);
+    expect(fit.clippedMessages).toBeGreaterThan(0);
+    const kept = fit.body.messages as Array<Record<string, unknown>>;
+    expect(String(kept.at(-1)?.content)).toContain("已截断");
   });
 });
 

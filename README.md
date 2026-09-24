@@ -110,6 +110,7 @@ with a message naming it, plus the `QODER_PROTOCOL=legacy` escape hatch.
 Other differences worth knowing:
 
 - Thinking level maps to `reasoning: { effort }`. `off` is sent as `none` only for models that declare a disabled mode; models without one (e.g. Cantus) get no effort field, because the model server rejects `none` for them — and the selector hides `off` accordingly.
+- The model server answers `500 internal server error` (no proper 413) for request bodies above ~256 KiB. Because every turn replays the session, a long session would fail permanently, so the replay is trimmed: oldest messages are dropped at `user` boundaries (never orphaning a tool result) and, if a single turn is still too big, contents are clipped. The turn then starts with a warning saying how much was dropped.
 - The model server reports tokens but no `credits`, so pi's per-session credit
   total stays at 0 while the token counts are accurate.
 - The model server wraps long JSON chunks mid-token (a raw newline inside the
