@@ -24,7 +24,6 @@ import {
 import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
 import { type DsmlToolCall, DsmlToolParser } from "./dsml.js";
 import { withQoderHttpTimeout } from "./http.js";
-import { runModelServerTurn, useQoderModelServer } from "./model-server.js";
 import { prepareQoderRequest } from "./prepare.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
@@ -196,9 +195,8 @@ export function streamQoder(
 
   (async () => {
     try {
-      // Shared prelude (identity, quota, model key, replayed messages, tools,
-      // generation parameters) — used by both the legacy COSY transport and the
-      // qodercli model-server transport.
+      // Prelude: identity, quota, model key, replayed messages, tools and
+      // generation parameters.
       const prepared = await prepareQoderRequest(model, context, options);
       const {
         providerMode,
@@ -235,14 +233,6 @@ export function streamQoder(
       let queueNoticeIndex: number | null = null;
 
       stream.push({ type: "start", partial: output });
-
-      // qodercli's model-server transport (QODER_PROTOCOL=auto|v2) is a plain
-      // OpenAI-compatible SSE stream: no request signing, no response envelope
-      // and native tool_calls instead of DSML XML in the text channel.
-      if (useQoderModelServer(providerMode)) {
-        await runModelServerTurn({ prepared, options, output, stream });
-        return;
-      }
 
       const attemptOnce = async (): Promise<void> => {
         // Inner AbortController so both the caller's signal and an idle timeout

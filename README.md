@@ -17,8 +17,7 @@ A [pi](https://shittycodingagent.ai/) extension that connects pi to the **Qoder 
   - `qoder-cn` — Qoder China, forced to CN endpoints and independent of `QODER_REGION`.
 - **Interactive login** — Global Qoder supports browser device-code flow or Personal Access Token (PAT); Qoder CN uses a PAT login entry.
 - **PAT → job-token exchange** — a Qoder PAT (`pt-...`) is exchanged for a short-lived job token (`jt-...`), mirroring the official `qodercli` flow. The stored PAT is re-exchanged transparently when the token expires.
-- **Two chat protocols** — `QODER_PROTOCOL=auto` (default) uses qodercli's OpenAI-compatible model server (`/model/v1/chat/completions`, native `tool_calls`) for every global model, and keeps the legacy COSY gateway only for CN; `v2` / `legacy` force one transport. See [Transport protocol](#transport-protocol-qoder_protocol).
-- **COSY signing + WAF bypass** — full COSY signature headers (RSA/AES-CBC/MD5) and the `Encode=1` body obfuscation the legacy gateway expects.
+- **Matches qodercli's transport** — talks to the same COSY gateway (`agent_chat_generation`) that qodercli elects as its inference endpoint, with the full COSY signature headers (RSA/AES-CBC/MD5) and the `Encode=1` body obfuscation that gateway expects. One protocol, no transport switch.
 - **Dynamic model catalog** — model limits, effort config and options are fetched from `/algo/api/v2/model/list` and cached locally; static fallbacks ship for both editions.
 - **Reasoning / thinking support** — thinking is extracted live from the API `reasoning_content` channel and from HTML-like `thinking` tags inline in the content stream.
 - **Reasoning effort (推理强度)** — pi's thinking level maps to Qoder's `reasoning_effort` wire parameter (`none`/`low`/`medium`/`high`/`xhigh`/`max`), so `/thinking`-style controls actually take effect. Models with an explicit effort surface (e.g. DeepSeek V4 `high`/`max`) expose those levels via `thinking` metadata.
@@ -79,42 +78,20 @@ export QODER_REGION=cn       # or QODER_BACKEND=cn / QODER_MODE=cn
 
 Setting a CN PAT without a global PAT also auto-selects CN mode for the `qoder` entry, but the recommended explicit China entry is `/login qoder-cn` / `--provider qoder-cn`.
 
-### Transport protocol (`QODER_PROTOCOL`)
+### Transport
 
-Qoder exposes two chat protocols, and this provider can use either:
+The provider talks to the same endpoint qodercli uses. qodercli 1.1.62 elects
+`https://api3.qoder.sh` as its inference endpoint while its `model_server_transport`
+feature gate is disabled, so this provider follows that single path:
 
-| | `v2` — model server (qodercli's current protocol) | `legacy` — COSY gateway |
-|---|---|---|
-| Endpoint | `POST https://api2-v2.qoder.sh/model/v1/chat/completions` | `POST https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation` |
-| Auth | `Authorization: Bearer <token>` | COSY envelope signature (RSA + AES + MD5) |
-| Body | Plain OpenAI JSON | `Encode=1` obfuscated JSON |
-| Response | Plain `data: {...}` chunks + `data: [DONE]` | `{statusCodeValue, body}` envelopes |
-| Tool calls | Native streaming `tool_calls` | DSML/XML text in the content channel |
+- Endpoint: `POST https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`
+- Auth: COSY envelope signature (RSA + AES + MD5)
+- Body: `Encode=1` obfuscated JSON
+- Response: `{statusCodeValue, body}` envelopes
+- Tool calls: DSML/XML text in the content channel
 
-```bash
-export QODER_PROTOCOL=auto    # default: v2 where available, legacy otherwise
-export QODER_PROTOCOL=v2      # force the model server (fails on models it does not serve)
-export QODER_PROTOCOL=legacy  # force the COSY gateway
-export QODER_MODEL_SERVER_HOST=api2-v2.qoder.sh  # override the model server host
-```
-
-`auto` sends every global turn to the model server; the CN provider keeps the
-COSY gateway because the CN gateway has no `/model/v1` route yet. Every model in
-Qoder's catalog is served there — the request declares `metadata.business`
-(`product: "cli"`), which is what the model server uses to resolve the model
-registry (without it, CLI-only keys such as `dfmodel` are rejected as
-`invalid_model_error`). There is no local "legacy-only model" list, no name
-mapping and no automatic fallback: a model the model server does not serve fails
-with a message naming it, plus the `QODER_PROTOCOL=legacy` escape hatch.
-
-Other differences worth knowing:
-
-- Thinking level maps to `reasoning: { effort }`. `off` is sent as `none` only for models that declare a disabled mode; models without one (e.g. Cantus) get no effort field, because the model server rejects `none` for them — and the selector hides `off` accordingly.
-- The model server answers `500 internal server error` (no proper 413) for request bodies above ~256 KiB. Because every turn replays the session, a long session would fail permanently, so the replay is trimmed: oldest messages are dropped at `user` boundaries (never orphaning a tool result) and, if a single turn is still too big, contents are clipped. The turn then starts with a warning saying how much was dropped.
-- The model server reports tokens but no `credits`, so pi's per-session credit
-  total stays at 0 while the token counts are accurate.
-- The model server wraps long JSON chunks mid-token (a raw newline inside the
-  payload), which the client repairs when framing SSE events.
+There is no second protocol and no transport switch to configure. Thinking level
+maps to the wire `reasoning_effort` parameter.
 
 ### Queue auto-retry
 
@@ -149,8 +126,7 @@ Global:
 - User info: `https://openapi.qoder.sh/api/v1/userinfo`
 - Usage: `https://openapi.qoder.sh/api/v2/quota/usage`
 - Model list gateway: `https://api3.qoder.sh/algo/api/v2/model/list?Encode=1`
-- Chat, `QODER_PROTOCOL=v2`: `https://api2-v2.qoder.sh/model/v1/chat/completions`
-- Chat, `QODER_PROTOCOL=legacy`: `https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`
+- Chat: `https://api3.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation`
 
 China:
 
@@ -194,12 +170,11 @@ src/
 ├── index.ts            # Extension registration (qoder + qoder-cn)
 ├── cosy.ts             # COSY signature, machine ID, region/endpoints, CN model aliases
 ├── prepare.ts          # Shared prelude: identity, quota, model key, messages, tools
-├── model-server.ts     # v2 transport (qodercli model server) + QODER_PROTOCOL switch
 ├── login.ts            # OAuth device flow + PAT login sequence
 ├── pat.ts              # PAT → job-token exchange + identity resolution
 ├── models.ts           # Model definitions and dynamic config cache
 ├── oauth.ts            # PAT / OAuth callback orchestrator
-├── stream.ts           # Legacy COSY streaming handler (+ transport dispatch)
+├── stream.ts           # COSY streaming handler
 ├── transform.ts        # Message conversions (OpenAI schema mapping)
 ├── thinking-parser.ts  # Fallback thinking tag parser
 ├── qoder-encoding.ts   # WAF bypass body encoder (legacy transport)

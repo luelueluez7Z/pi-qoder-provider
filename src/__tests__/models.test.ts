@@ -1,25 +1,12 @@
-import { existsSync, readFileSync } from "node:fs";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MODEL_SERVER_CONTEXT_TOKENS } from "../model-server.js";
+import { describe, expect, it } from "vitest";
 import {
   deriveQoderThinking,
-  effectiveContextWindow,
   formatQoderPriceFactor,
   getCachedModelConfig,
-  getCachedModels,
   staticCnModels,
   staticModels,
   ZERO_COST,
 } from "../models.js";
-
-// getCachedModels is the only path that hands models to pi, and its whole job
-// here is the transport clamp. Both of its sources (a cache file up to an hour
-// old, and the raw static catalogs) are read through node:fs, so the fs surface
-// is stubbed rather than the function under test.
-vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
-  return { ...actual, existsSync: vi.fn(() => false), readFileSync: vi.fn(() => "") };
-});
 
 describe("static model catalogs", () => {
   it("global catalog exposes tier models", () => {
@@ -142,66 +129,6 @@ describe("formatQoderPriceFactor", () => {
   it("returns empty string for unknown factors", () => {
     expect(formatQoderPriceFactor(undefined)).toBe("");
     expect(formatQoderPriceFactor(Number.NaN)).toBe("");
-  });
-});
-
-describe("effectiveContextWindow", () => {
-  afterEach(() => {
-    delete process.env.QODER_PROTOCOL;
-  });
-
-  it("publishes the model server's request capacity for global turns", () => {
-    delete process.env.QODER_PROTOCOL; // auto -> model server for global
-    expect(effectiveContextWindow(1_000_000, "global")).toBe(MODEL_SERVER_CONTEXT_TOKENS);
-    expect(effectiveContextWindow(200_000, "global")).toBe(MODEL_SERVER_CONTEXT_TOKENS);
-    // A catalog window already below the transport cap is kept as-is.
-    expect(effectiveContextWindow(32_000, "global")).toBe(32_000);
-  });
-
-  it("keeps the catalog window for CN and on the legacy transport", () => {
-    delete process.env.QODER_PROTOCOL;
-    expect(effectiveContextWindow(1_000_000, "cn")).toBe(1_000_000);
-    process.env.QODER_PROTOCOL = "legacy";
-    expect(effectiveContextWindow(1_000_000, "global")).toBe(1_000_000);
-  });
-});
-
-describe("getCachedModels transport clamp", () => {
-  beforeEach(() => {
-    delete process.env.QODER_PROTOCOL;
-    vi.mocked(existsSync).mockReturnValue(false);
-    vi.mocked(readFileSync).mockReturnValue("");
-  });
-
-  afterEach(() => {
-    vi.mocked(existsSync).mockReset();
-    vi.mocked(readFileSync).mockReset();
-  });
-
-  it("clamps a cached window that predates the clamp", () => {
-    vi.mocked(existsSync).mockReturnValue(true);
-    vi.mocked(readFileSync).mockReturnValue(
-      JSON.stringify({ updatedAt: Date.now(), models: [{ id: "dfmodel", contextWindow: 1_000_000 }] }),
-    );
-    const models = getCachedModels("global");
-    expect(models[0]?.contextWindow).toBe(MODEL_SERVER_CONTEXT_TOKENS);
-  });
-
-  it("clamps the static fallback catalog used when the cache is missing or unreadable", () => {
-    const models = getCachedModels("global");
-    expect(models.find((m) => m.id === "dfmodel")?.contextWindow).toBe(MODEL_SERVER_CONTEXT_TOKENS);
-    expect(models.find((m) => m.id === "auto")?.contextWindow).toBe(MODEL_SERVER_CONTEXT_TOKENS);
-  });
-
-  it("leaves the catalog window alone on the legacy transport", () => {
-    process.env.QODER_PROTOCOL = "legacy";
-    const models = getCachedModels("global");
-    expect(models.find((m) => m.id === "dfmodel")?.contextWindow).toBe(1_000_000);
-  });
-
-  it("leaves CN windows alone because CN never uses the model server", () => {
-    const models = getCachedModels("cn");
-    expect(models.find((m) => m.id === "deepseek-v4-pro")?.contextWindow).toBe(1_000_000);
   });
 });
 

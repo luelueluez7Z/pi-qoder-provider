@@ -13,7 +13,6 @@ import {
 } from "./cosy.js";
 import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
 import { withQoderHttpTimeout } from "./http.js";
-import { MODEL_SERVER_CONTEXT_TOKENS, useQoderModelServer } from "./model-server.js";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
@@ -525,28 +524,15 @@ export function qoderThinkingLevelMap(m: QoderModelDef): Record<string, string |
   return map;
 }
 
-/**
- * Models as pi should see them: the transport clamp is applied here, at the read
- * boundary, rather than when the cache is built. The cache is up to an hour old
- * and the static catalogs are raw, so clamping on write would let a stale window
- * reach pi — and would freeze the window at the model server's capacity even if
- * the session later switched to the legacy transport.
- */
 export function getCachedModels(mode?: string): QoderModelDef[] {
-  const providerMode = getQoderMode(mode);
-  const clamp = (m: QoderModelDef): QoderModelDef => {
-    const contextWindow = effectiveContextWindow(m.contextWindow, providerMode);
-    return contextWindow === m.contextWindow ? m : { ...m, contextWindow };
-  };
-
   const cachePath = getQoderCachePath(mode);
   if (existsSync(cachePath)) {
     try {
       const data = JSON.parse(readFileSync(cachePath, "utf8"));
-      if (data && Array.isArray(data.models)) return (data.models as QoderModelDef[]).map(clamp);
+      if (data && Array.isArray(data.models)) return data.models;
     } catch {}
   }
-  return (isQoderCNMode(mode) ? staticCnModels : staticModels).map(clamp);
+  return isQoderCNMode(mode) ? staticCnModels : staticModels;
 }
 
 export function getCachedModelConfig(modelKey: string, mode?: string): QoderModelEntry | null {
@@ -610,19 +596,6 @@ function withMaxContextAsDefault(entry: QoderModelEntry): QoderModelEntry {
       ]),
     ),
   };
-}
-
-/**
- * Context window to report to pi for a model.
- *
- * The model's catalog window is its own capacity; when turns go through the model
- * server the transport caps a request at MAX_MODEL_SERVER_BODY_BYTES, so reporting
- * the catalog window would let the session grow past what any request can carry.
- * With the real capacity published, pi compacts (contextWindow - reserveTokens)
- * before the replay outgrows a single request.
- */
-export function effectiveContextWindow(catalogContext: number, providerMode: string): number {
-  return useQoderModelServer(providerMode) ? Math.min(catalogContext, MODEL_SERVER_CONTEXT_TOKENS) : catalogContext;
 }
 
 export function isCacheStale(mode?: string): boolean {
