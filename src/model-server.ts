@@ -101,6 +101,19 @@ function logModelServer(event: string, details: Record<string, unknown>): void {
 const BUSINESS_PRODUCT = "cli";
 const BUSINESS_TYPE = "agent";
 
+/**
+ * Whether thinking can be turned off for a model.
+ *
+ * Qoder's catalog declares `thinking_config.disabled` only for models that
+ * support it, and the model server answers `provider_error` for effort "none"
+ * on the rest (e.g. Cantus). For those the field must be omitted instead.
+ */
+export function canDisableThinking(modelConfig: {
+  thinking_config?: { disabled?: unknown; enabled?: unknown };
+}): boolean {
+  return !!modelConfig.thinking_config?.disabled;
+}
+
 /** Build the OpenAI-shaped request body for the model server. */
 export function buildModelServerBody(prepared: PreparedQoderRequest, requestId: string): Record<string, unknown> {
   const body: Record<string, unknown> = {
@@ -123,9 +136,14 @@ export function buildModelServerBody(prepared: PreparedQoderRequest, requestId: 
   };
   if (prepared.toolsRaw && prepared.toolsRaw.length > 0) body.tools = prepared.toolsRaw;
   // The model server honours the reasoning switch as `reasoning.effort`
-  // (top-level reasoning_effort is ignored). "none" must be sent explicitly —
-  // omitting it lets the upstream apply its own default.
-  if (prepared.isReasoning) body.reasoning = { effort: prepared.reasoningEffort };
+  // (top-level reasoning_effort / enable_thinking are ignored). "none" must be
+  // sent explicitly for models that declare a disabled mode — omitting it lets
+  // the upstream apply its own default. Models without that mode (e.g. Cantus)
+  // answer `provider_error` for effort "none", so the field is omitted there.
+  const disabledSupported = canDisableThinking(prepared.modelConfig);
+  if (prepared.isReasoning && (prepared.reasoningEffort !== "none" || disabledSupported)) {
+    body.reasoning = { effort: prepared.reasoningEffort };
+  }
   if (prepared.contextWindow) body.parameters = { context_length: prepared.contextWindow };
   return body;
 }

@@ -109,7 +109,7 @@ with a message naming it, plus the `QODER_PROTOCOL=legacy` escape hatch.
 
 Other differences worth knowing:
 
-- Thinking level maps to `reasoning: { effort }`; `off` is sent as `none`.
+- Thinking level maps to `reasoning: { effort }`. `off` is sent as `none` only for models that declare a disabled mode; models without one (e.g. Cantus) get no effort field, because the model server rejects `none` for them — and the selector hides `off` accordingly.
 - The model server reports tokens but no `credits`, so pi's per-session credit
   total stays at 0 while the token counts are accurate.
 - The model server wraps long JSON chunks mid-token (a raw newline inside the

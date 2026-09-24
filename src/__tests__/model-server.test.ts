@@ -11,6 +11,7 @@ import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildModelServerBody,
+  canDisableThinking,
   formatModelServerError,
   getQoderModelServerChatURL,
   isCompleteJson,
@@ -295,6 +296,15 @@ describe("isCompleteJson", () => {
   it("treats non-object payloads as complete", () => {
     expect(isCompleteJson("[DONE]")).toBe(true);
     expect(isCompleteJson("plain text")).toBe(true);
+  });
+});
+
+describe("canDisableThinking", () => {
+  it("follows the catalog's disabled mode", () => {
+    // DeepSeek V4 declares thinking_config.disabled; Cantus does not.
+    expect(canDisableThinking({ thinking_config: { disabled: { description: "Disable thinking" } } })).toBe(true);
+    expect(canDisableThinking({ thinking_config: { enabled: { efforts: { high: {} } } } })).toBe(false);
+    expect(canDisableThinking({})).toBe(false);
   });
 });
 

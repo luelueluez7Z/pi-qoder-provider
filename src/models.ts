@@ -20,6 +20,8 @@ export interface QoderThinkingDef {
   mode: "effort";
   efforts: string[];
   defaultLevel?: string;
+  /** Whether the model exposes a disabled mode (catalog `thinking_config.disabled`). */
+  canDisable?: boolean;
 }
 
 /** Shape of a single entry returned by the Qoder /model/list endpoint. */
@@ -38,6 +40,8 @@ export interface QoderModelEntry {
     enabled?: {
       efforts?: Record<string, { description?: string; is_default?: boolean }>;
     };
+    /** Present only for models that can turn thinking off (e.g. Cantus has none). */
+    disabled?: { description?: string };
   };
   source?: string;
   [key: string]: unknown;
@@ -490,6 +494,7 @@ export function deriveQoderThinking(entry: QoderModelEntry, isReasoning: boolean
   return {
     mode: "effort",
     efforts,
+    canDisable: !!entry.thinking_config?.disabled,
     ...(defaultEffort ? { defaultLevel: defaultEffort } : {}),
   };
 }
@@ -497,12 +502,14 @@ export function deriveQoderThinking(entry: QoderModelEntry, isReasoning: boolean
 /**
  * Build a pi `thinkingLevelMap` from the qoder-supplied effort surface.
  *
- * `off` is always available (maps to qoder `"none"`). For every pi level that
- * qoder actually exposes (from `thinking_config.enabled.efforts`, e.g.
- * `["high","max"]` for DeepSeek V4), map it to its qoder wire value; levels
- * qoder does not support are set to `null` so the host hides them. This makes
- * the /model selector show exactly what qoder returns (off / high / max), not
- * a generic pi ladder.
+ * `off` is available only when the model exposes a disabled mode (catalog
+ * `thinking_config.disabled`, sent as effort `"none"`); models without it (e.g.
+ * Cantus) reject that effort with `provider_error`, so the host hides the level
+ * instead of offering one that cannot be honoured. For every pi level that qoder
+ * actually exposes (from `thinking_config.enabled.efforts`, e.g. `["high","max"]`
+ * for DeepSeek V4), map it to its qoder wire value; levels qoder does not support
+ * are set to `null` so the host hides them. This makes the /model selector show
+ * exactly what qoder returns, not a generic pi ladder.
  */
 export function qoderThinkingLevelMap(m: QoderModelDef): Record<string, string | null> {
   const def = m.thinking;
@@ -510,7 +517,7 @@ export function qoderThinkingLevelMap(m: QoderModelDef): Record<string, string |
   const efforts = new Set(def.efforts);
   // pi level -> qoder wire value (same name, except "off" -> "none")
   const piLevels = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
-  const map: Record<string, string | null> = { off: "none" };
+  const map: Record<string, string | null> = { off: def.canDisable ? "none" : null };
   for (const level of piLevels) {
     map[level] = efforts.has(level) ? level : null;
   }

@@ -145,7 +145,30 @@ describe("deriveQoderThinking", () => {
       } as Parameters<typeof deriveQoderThinking>[0],
       true,
     );
-    expect(thinking).toEqual({ mode: "effort", efforts: ["high", "max"], defaultLevel: "high" });
+    expect(thinking).toEqual({ mode: "effort", efforts: ["high", "max"], canDisable: false, defaultLevel: "high" });
+  });
+
+  it("reports whether the model exposes a disabled mode", () => {
+    const withDisabled = deriveQoderThinking(
+      {
+        key: "dmodel",
+        thinking_config: {
+          disabled: { description: "Disable thinking" },
+          enabled: { efforts: { high: {}, max: {} } },
+        },
+      } as Parameters<typeof deriveQoderThinking>[0],
+      true,
+    );
+    expect(withDisabled?.canDisable).toBe(true);
+
+    // Cantus-style: a closed effort set with no way to turn thinking off.
+    const withoutDisabled = deriveQoderThinking(
+      { key: "cmodel", thinking_config: { enabled: { efforts: { high: {}, low: {} } } } } as Parameters<
+        typeof deriveQoderThinking
+      >[0],
+      true,
+    );
+    expect(withoutDisabled?.canDisable).toBe(false);
   });
 
   it("returns undefined for non-reasoning models", () => {
