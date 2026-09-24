@@ -13,6 +13,7 @@ import {
 } from "./cosy.js";
 import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
 import { withQoderHttpTimeout } from "./http.js";
+import { MODEL_SERVER_CONTEXT_TOKENS, useQoderModelServer } from "./model-server.js";
 
 export const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
@@ -598,6 +599,19 @@ function withMaxContextAsDefault(entry: QoderModelEntry): QoderModelEntry {
   };
 }
 
+/**
+ * Context window to report to pi for a model.
+ *
+ * The model's catalog window is its own capacity; when turns go through the model
+ * server the transport caps a request at MAX_MODEL_SERVER_BODY_BYTES, so reporting
+ * the catalog window would let the session grow past what any request can carry.
+ * With the real capacity published, pi compacts (contextWindow - reserveTokens)
+ * before the replay outgrows a single request.
+ */
+export function effectiveContextWindow(catalogContext: number, providerMode: string): number {
+  return useQoderModelServer(providerMode) ? Math.min(catalogContext, MODEL_SERVER_CONTEXT_TOKENS) : catalogContext;
+}
+
 export function isCacheStale(mode?: string): boolean {
   const cachePath = getQoderCachePath(mode);
   if (!existsSync(cachePath)) return true;
@@ -685,7 +699,7 @@ export async function updateQoderModelsCache(
         thinking,
         input: isVL ? ["text", "image"] : ["text"],
         cost: ZERO_COST,
-        contextWindow: ctxLen,
+        contextWindow: effectiveContextWindow(ctxLen, mode),
         maxTokens: entry.max_output_tokens || 32768,
         ...(priceFactor !== undefined ? { priceFactor } : {}),
       });

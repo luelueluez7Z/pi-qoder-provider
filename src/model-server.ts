@@ -155,6 +155,16 @@ function modelLabel(prepared: PreparedQoderRequest): string {
 }
 
 /**
+ * The model server caps request bodies at 256 KiB (see
+ * MAX_MODEL_SERVER_BODY_BYTES), which is about 64k tokens of mixed code and prose
+ * at the ~4 bytes/token measured on real sessions. Passing a model's catalog
+ * window (200K–1M) to pi would let a session grow far past what one request can
+ * carry, so the model_server window is reported instead and pi's own compaction
+ * keeps the session inside it.
+ */
+export const MODEL_SERVER_CONTEXT_TOKENS = 64 * 1024;
+
+/**
  * The model server answers `500 internal server error` (no proper 413) for
  * request bodies above ~256 KiB — measured 2026-09: 245 KB passes, 260 KB fails,
  * reproducibly, for every model. A long pi session replays its whole history, so

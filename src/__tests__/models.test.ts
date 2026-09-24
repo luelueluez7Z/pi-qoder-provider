@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { MODEL_SERVER_CONTEXT_TOKENS } from "../model-server.js";
 import {
   deriveQoderThinking,
+  effectiveContextWindow,
   formatQoderPriceFactor,
   getCachedModelConfig,
   staticCnModels,
@@ -129,6 +131,27 @@ describe("formatQoderPriceFactor", () => {
   it("returns empty string for unknown factors", () => {
     expect(formatQoderPriceFactor(undefined)).toBe("");
     expect(formatQoderPriceFactor(Number.NaN)).toBe("");
+  });
+});
+
+describe("effectiveContextWindow", () => {
+  afterEach(() => {
+    delete process.env.QODER_PROTOCOL;
+  });
+
+  it("publishes the model server's request capacity for global turns", () => {
+    delete process.env.QODER_PROTOCOL; // auto -> model server for global
+    expect(effectiveContextWindow(1_000_000, "global")).toBe(MODEL_SERVER_CONTEXT_TOKENS);
+    expect(effectiveContextWindow(200_000, "global")).toBe(MODEL_SERVER_CONTEXT_TOKENS);
+    // A catalog window already below the transport cap is kept as-is.
+    expect(effectiveContextWindow(32_000, "global")).toBe(32_000);
+  });
+
+  it("keeps the catalog window for CN and on the legacy transport", () => {
+    delete process.env.QODER_PROTOCOL;
+    expect(effectiveContextWindow(1_000_000, "cn")).toBe(1_000_000);
+    process.env.QODER_PROTOCOL = "legacy";
+    expect(effectiveContextWindow(1_000_000, "global")).toBe(1_000_000);
   });
 });
 
