@@ -236,6 +236,7 @@ describe("model-server transport", () => {
     const { fetch: fetchMock } = modelServerFetch(INVALID_MODEL_SSE);
     globalThis.fetch = fetchMock;
 
+    // No silent legacy fallback: the model server's rejection is the answer.
     const events = await consume(streamQoder(makeModel("dfmodel"), makeContext(), { apiKey: "fake" }));
     expect(errorMessage(events)).toContain("QODER_PROTOCOL=legacy");
   });
@@ -255,20 +256,17 @@ describe("model-server routing", () => {
     delete process.env.QODER_MODEL_SERVER_HOST;
   });
 
-  it("routes auto mode per model and keeps CN on the legacy gateway", () => {
+  it("routes every global model to the model server and keeps CN on the legacy gateway", () => {
     delete process.env.QODER_PROTOCOL;
-    expect(useQoderModelServer("global", "dmodel")).toBe(true);
-    expect(useQoderModelServer("global", "auto")).toBe(true);
-    expect(useQoderModelServer("global", "dfmodel")).toBe(false);
-    expect(useQoderModelServer("global", "qmodel_38max")).toBe(false);
-    expect(useQoderModelServer("cn", "dmodel")).toBe(false);
+    expect(useQoderModelServer("global")).toBe(true);
+    expect(useQoderModelServer("cn")).toBe(false);
   });
 
   it("honours explicit v2 / legacy settings", () => {
     process.env.QODER_PROTOCOL = "v2";
-    expect(useQoderModelServer("cn", "dfmodel")).toBe(true);
+    expect(useQoderModelServer("cn")).toBe(true);
     process.env.QODER_PROTOCOL = "legacy";
-    expect(useQoderModelServer("global", "dmodel")).toBe(false);
+    expect(useQoderModelServer("global")).toBe(false);
   });
 
   it("uses the model-server URL, honouring the host override", () => {
@@ -278,8 +276,8 @@ describe("model-server routing", () => {
   });
 
   it("formats known error codes in Chinese", () => {
-    expect(formatModelServerError("invalid_model_error", "Unsupported model", "dfmodel")).toContain(
-      "QODER_PROTOCOL=legacy",
+    expect(formatModelServerError("invalid_model_error", "Unsupported model", "DeepSeek-Flash（dfmodel）")).toContain(
+      "DeepSeek-Flash（dfmodel）",
     );
     expect(formatModelServerError("provider_error", "All models failed", "dmodel")).toContain("上游模型调用失败");
   });
@@ -297,6 +295,20 @@ describe("isCompleteJson", () => {
   it("treats non-object payloads as complete", () => {
     expect(isCompleteJson("[DONE]")).toBe(true);
     expect(isCompleteJson("plain text")).toBe(true);
+  });
+});
+
+describe("business identity", () => {
+  it("declares the CLI business product so the model registry resolves catalog keys", async () => {
+    const prepared = await prepareQoderRequest(makeModel("dfmodel"), makeContext(), { apiKey: "fake" });
+    const body = buildModelServerBody(prepared, "rid-biz");
+    const metadata = body.metadata as { business?: Record<string, unknown> };
+
+    // Without metadata.business the model server answers invalid_model_error for
+    // keys that only the CLI product knows (dfmodel, qmodel_38max, gfmodel, ...).
+    expect(metadata.business).toEqual({ product: "cli", type: "agent" });
+    // The catalog key goes on the wire verbatim — no local name mapping.
+    expect(body.model).toBe("dfmodel");
   });
 });
 

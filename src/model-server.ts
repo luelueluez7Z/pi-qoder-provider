@@ -37,22 +37,6 @@ const MAX_SSE_BUFFER_CHARS = 8 * 1024 * 1024;
 
 export type QoderProtocol = "auto" | "v2" | "legacy";
 
-/**
- * Model keys the legacy gateway serves but the model server rejects with
- * `invalid_model_error` (probed against api2-v2 2026-09). Everything else —
- * including newly released keys — is routed to the model server under "auto".
- */
-const LEGACY_ONLY_MODELS = new Set([
-  "smodel",
-  "cmodel",
-  "qmodel_38max",
-  "qfmodel",
-  "qmodel_latest",
-  "kmodel_latest",
-  "gfmodel",
-  "dfmodel",
-]);
-
 function parseProtocolMode(raw: string | undefined): QoderProtocol | undefined {
   const value = (raw || "").trim().toLowerCase();
   if (!value) return undefined;
@@ -82,14 +66,18 @@ export function getQoderModelServerChatURL(): string {
  * Whether this turn should use the model server.
  *  - legacy: never
  *  - v2: always (even for CN / VPC hosts, so an explicit override always wins)
- *  - auto: everything except CN mode and the keys known to be legacy-only
+ *  - auto: everything except CN mode, whose gateway has no /model/v1 route at all
+ *
+ * `auto` deliberately does NOT keep a local list of "legacy-only" models: the
+ * wire support is decided by the server, and a model the model server does not
+ * serve yet fails loudly (invalid_model_error) instead of silently falling back
+ * to the COSY gateway.
  */
-export function useQoderModelServer(providerMode: string, qoderModel: string): boolean {
+export function useQoderModelServer(providerMode: string): boolean {
   const protocol = getQoderProtocol();
   if (protocol === "legacy") return false;
   if (protocol === "v2") return true;
-  if (isQoderCNMode(providerMode)) return false;
-  return !LEGACY_ONLY_MODELS.has(qoderModel);
+  return !isQoderCNMode(providerMode);
 }
 
 function describeError(error: unknown): string {
@@ -99,6 +87,19 @@ function describeError(error: unknown): string {
 function logModelServer(event: string, details: Record<string, unknown>): void {
   if (isQoderDebugEnabled()) logDebug("model-server", { event, ...details });
 }
+
+/**
+ * Business identity sent in metadata.business.
+ *
+ * The model server resolves a model key against the registry of the business
+ * product it is called for: without this block the catalog keys that only the
+ * CLI product knows (`dfmodel`, `qmodel_38max`, `gfmodel`, `cmodel`, …) come
+ * back as `invalid_model_error`. qodercli always sends `business.product` (its
+ * client identity) plus the business type; these are the same defaults its
+ * bundle falls back to (product "cli", type "agent").
+ */
+const BUSINESS_PRODUCT = "cli";
+const BUSINESS_TYPE = "agent";
 
 /** Build the OpenAI-shaped request body for the model server. */
 export function buildModelServerBody(prepared: PreparedQoderRequest, requestId: string): Record<string, unknown> {
@@ -117,6 +118,7 @@ export function buildModelServerBody(prepared: PreparedQoderRequest, requestId: 
         task_id: "common",
         client_type: CLIENT_TYPE,
       },
+      business: { product: BUSINESS_PRODUCT, type: BUSINESS_TYPE },
     },
   };
   if (prepared.toolsRaw && prepared.toolsRaw.length > 0) body.tools = prepared.toolsRaw;
@@ -128,14 +130,19 @@ export function buildModelServerBody(prepared: PreparedQoderRequest, requestId: 
   return body;
 }
 
+/** Model label for error messages: the catalog's display name, plus its wire key. */
+function modelLabel(prepared: PreparedQoderRequest): string {
+  const display = prepared.modelConfig.display_name;
+  return display ? `${display}（${prepared.qoderModel}）` : prepared.qoderModel;
+}
+
 /** Friendly Chinese hint for a model-server business error. */
 export function formatModelServerError(code: string, message: string, modelName?: string): string {
   const model = modelName || "当前模型";
   switch (code) {
     case "invalid_model_error":
       return (
-        `模型 ${model} 未接入新的模型服务协议（${message}）。` +
-        `请改用其他模型，或设置 QODER_PROTOCOL=legacy 走旧协议。`
+        `模型 ${model} 尚未接入模型服务（${message}）。` + `请改用其他模型，或设置 QODER_PROTOCOL=legacy 走旧网关。`
       );
     case "provider_error":
       return `上游模型调用失败（${model}）：${message}`;
@@ -252,6 +259,7 @@ export async function runModelServerTurn(args: {
       requestId,
       url: chatURL,
       model: prepared.qoderModel,
+      catalogKey: prepared.qoderModel,
       sessionId: prepared.sessionID,
       bodyBytes: bodyBytes.byteLength,
       messageCount: (requestBody.messages as unknown[]).length,
@@ -619,7 +627,7 @@ export async function runModelServerTurn(args: {
         if (isErrorPayload) {
           const message = typeof parsed.message === "string" ? parsed.message : jsonText.slice(0, 300);
           logModelServer("error-event", { requestId, eventName, code, message, sseEventCount });
-          throw new Error(formatModelServerError(code, message, prepared.qoderModel));
+          throw new Error(formatModelServerError(code, message, modelLabel(prepared)));
         }
 
         if (applyChunk(parsed)) finishReasonSeen = true;

@@ -239,7 +239,7 @@ export function streamQoder(
       // qodercli's model-server transport (QODER_PROTOCOL=auto|v2) is a plain
       // OpenAI-compatible SSE stream: no request signing, no response envelope
       // and native tool_calls instead of DSML XML in the text channel.
-      if (useQoderModelServer(providerMode, qoderModel)) {
+      if (useQoderModelServer(providerMode)) {
         await runModelServerTurn({ prepared, options, output, stream });
         return;
       }

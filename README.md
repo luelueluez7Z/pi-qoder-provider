@@ -17,7 +17,7 @@ A [pi](https://shittycodingagent.ai/) extension that connects pi to the **Qoder 
   - `qoder-cn` — Qoder China, forced to CN endpoints and independent of `QODER_REGION`.
 - **Interactive login** — Global Qoder supports browser device-code flow or Personal Access Token (PAT); Qoder CN uses a PAT login entry.
 - **PAT → job-token exchange** — a Qoder PAT (`pt-...`) is exchanged for a short-lived job token (`jt-...`), mirroring the official `qodercli` flow. The stored PAT is re-exchanged transparently when the token expires.
-- **Two chat protocols** — `QODER_PROTOCOL=auto` (default) uses qodercli's OpenAI-compatible model server (`/model/v1/chat/completions`, native `tool_calls`) wherever Qoder serves the model, and falls back to the legacy COSY gateway for the rest; `v2` / `legacy` force one transport. See [Transport protocol](#transport-protocol-qoder_protocol).
+- **Two chat protocols** — `QODER_PROTOCOL=auto` (default) uses qodercli's OpenAI-compatible model server (`/model/v1/chat/completions`, native `tool_calls`) for every global model, and keeps the legacy COSY gateway only for CN; `v2` / `legacy` force one transport. See [Transport protocol](#transport-protocol-qoder_protocol).
 - **COSY signing + WAF bypass** — full COSY signature headers (RSA/AES-CBC/MD5) and the `Encode=1` body obfuscation the legacy gateway expects.
 - **Dynamic model catalog** — model limits, effort config and options are fetched from `/algo/api/v2/model/list` and cached locally; static fallbacks ship for both editions.
 - **Reasoning / thinking support** — thinking is extracted live from the API `reasoning_content` channel and from HTML-like `thinking` tags inline in the content stream.
@@ -98,11 +98,14 @@ export QODER_PROTOCOL=legacy  # force the COSY gateway
 export QODER_MODEL_SERVER_HOST=api2-v2.qoder.sh  # override the model server host
 ```
 
-`auto` sends a turn to the model server unless the provider is `qoder-cn` (the CN
-gateway has no `/model/v1` route yet) or the resolved model key is one the model
-server rejects today (`dfmodel`, `qmodel_38max`, `qfmodel`, `qmodel_latest`,
-`kmodel_latest`, `gfmodel`, `cmodel`, `smodel`). Forcing `v2` on such a model
-surfaces a clear error naming `QODER_PROTOCOL=legacy`.
+`auto` sends every global turn to the model server; the CN provider keeps the
+COSY gateway because the CN gateway has no `/model/v1` route yet. Every model in
+Qoder's catalog is served there — the request declares `metadata.business`
+(`product: "cli"`), which is what the model server uses to resolve the model
+registry (without it, CLI-only keys such as `dfmodel` are rejected as
+`invalid_model_error`). There is no local "legacy-only model" list, no name
+mapping and no automatic fallback: a model the model server does not serve fails
+with a message naming it, plus the `QODER_PROTOCOL=legacy` escape hatch.
 
 Other differences worth knowing:
 
