@@ -2,7 +2,6 @@ import crypto from "node:crypto";
 import type {
   Api,
   AssistantMessage,
-  AssistantMessageEventStream,
   Model,
   SimpleStreamOptions,
   TextContent,
@@ -10,7 +9,10 @@ import type {
   ToolCall,
   TranscriptContext,
 } from "@earendil-works/pi-ai";
-import * as PiAi from "@earendil-works/pi-ai";
+// Imported from the subpath instead of the package entry: the entry pulls in the
+// whole model catalog (~1.6MB, ~200ms at extension load), while this util is 3KB
+// and defines the same class the entry re-exports.
+import { AssistantMessageEventStream } from "@earendil-works/pi-ai/utils/event-stream";
 import {
   buildAuthHeaders,
   createQoderQueueError,
@@ -171,9 +173,7 @@ export function streamQoder(
   context: TranscriptContext,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
-  const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
-    .AssistantMessageEventStream;
-  const stream = new StreamCtor();
+  const stream = new AssistantMessageEventStream();
 
   const output: AssistantMessage = {
     role: "assistant",

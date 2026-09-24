@@ -3,12 +3,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Api, Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
+// Subpath import (see stream.ts): avoids loading the whole pi-ai entry (~1.6MB)
+// at extension load; the entry re-exports these same functions from here.
 import {
   collapseSystemMessages,
   getCurrentSystemPrompt,
   getCurrentTools,
   withoutInitialSystemMessage,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/utils/transcript";
 import {
   getMachineId,
   getQoderCNDirectModel,
