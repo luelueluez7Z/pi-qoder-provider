@@ -9,6 +9,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as debugLog from "../debug-log.js";
 import { streamQoder } from "../stream.js";
 import { resetQoderQuotaCache } from "../usage.js";
 
@@ -487,8 +488,237 @@ describe("streamQoder", () => {
 
     const err = events.find((event) => event.type === "error");
     expect(err, "expected an error event for malformed tool arguments").toBeDefined();
-    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("Unexpected end");
+    expect((err as { error: AssistantMessage }).error.errorMessage).toContain("unparseable tool call");
+    expect(events.some((event) => event.type === "toolcall_start" || event.type === "toolcall_end")).toBe(false);
     expect(events.find((event) => event.type === "done")).toBeUndefined();
+  });
+
+  it.each([
+    '{"command":',
+    "null",
+    "[]",
+    "42",
+  ])("corrects invalid native arguments %s once without executing the abandoned batch", async (argumentsText) => {
+    const first =
+      sseEnvelope(chunk({ reasoning_content: "Need to inspect the log.", content: "Checking." })) +
+      sseEnvelope(
+        chunk({
+          tool_calls: [
+            { index: 0, id: "bad", function: { name: "bash", arguments: argumentsText } },
+            { index: 1, id: "sibling", function: { name: "bash", arguments: '{"command":"ls"}' } },
+          ],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const second =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "corrected", function: { name: "bash", arguments: '{"command":"pwd"}' } }],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const fetchMock = sequenceFetch([first, second]) as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    expect(done).toBeDefined();
+    expect(done.message.content.filter((block) => block.type === "toolCall")).toEqual([
+      { type: "toolCall", id: "corrected", name: "bash", arguments: { command: "pwd" } },
+    ]);
+    expect(events.filter((event) => event.type === "toolcall_start")).toHaveLength(1);
+    expect(done.message.usage.totalTokens).toBe(4);
+    const calls = fetchMock.mock.calls.filter((call) => !/userinfo|quota\/usage/.test(String(call[0])));
+    expect(calls).toHaveLength(2);
+    const request = JSON.parse(decodeQoderBody(Buffer.from(calls[1][1].body).toString("utf8")));
+    const assistant = request.messages.find((message: { tool_calls?: unknown[] }) => message.tool_calls?.length === 2);
+    expect(assistant).toMatchObject({ content: "Checking.", reasoning_content: "Need to inspect the log." });
+    expect(assistant.content).not.toContain("<thinking>");
+    const feedback = request.messages.filter((message: { role: string }) => message.role === "tool");
+    expect(feedback.map((message: { tool_call_id: string }) => message.tool_call_id)).toEqual(["bad", "sibling"]);
+    expect(feedback[0].content).toContain("not a valid JSON object");
+    expect(feedback[1].content).toContain("another call");
+  });
+
+  it("keeps native and DSML calls separate in a valid mixed response", async () => {
+    const sse =
+      sseEnvelope(
+        chunk({
+          content: '<invoke name="read"><parameter name="path">README.md</parameter></invoke>',
+          tool_calls: [{ index: 0, id: "native", function: { name: "bash", arguments: '{"command":"ls"}' } }],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    const calls = done.message.content.filter((block) => block.type === "toolCall");
+    expect(calls).toHaveLength(2);
+    expect(calls.map((call) => call.name)).toEqual(["read", "bash"]);
+    expect(calls[1].id).toBe("native");
+    expect(events.filter((event) => event.type === "toolcall_end")).toHaveLength(2);
+  });
+
+  it("provides paired feedback for DSML siblings when a native call is malformed", async () => {
+    const first =
+      sseEnvelope(
+        chunk({
+          content: '<invoke name="read"><parameter name="path">README.md</parameter></invoke>',
+          tool_calls: [{ index: 0, id: "bad", function: { name: "bash", arguments: '{"command":' } }],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const fetchMock = sequenceFetch([first, SUCCESS_SSE]) as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+    expect(events.some((event) => event.type === "done")).toBe(true);
+    expect(events.some((event) => event.type === "toolcall_start")).toBe(false);
+    const requests = fetchMock.mock.calls.filter((call) => !/userinfo|quota\/usage/.test(String(call[0])));
+    const request = JSON.parse(decodeQoderBody(Buffer.from(requests[1][1].body).toString("utf8")));
+    const assistant = request.messages.find((message: { tool_calls?: unknown[] }) => message.tool_calls?.length === 2);
+    const results = request.messages.filter((message: { role: string }) => message.role === "tool");
+    expect(assistant.tool_calls.map((call: { id: string }) => call.id)).toEqual(
+      results.map((message: { tool_call_id: string }) => message.tool_call_id),
+    );
+  });
+
+  it("honors cancellation on the corrective retry without exposing bad tools", async () => {
+    const invalid =
+      sseEnvelope(
+        chunk({ tool_calls: [{ index: 0, id: "bad", function: { name: "bash", arguments: '{"command":' } }] }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const controller = new AbortController();
+    const baseFetch = sequenceFetch([invalid]);
+    let chats = 0;
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (!/userinfo|quota\/usage/.test(String(input))) {
+        chats++;
+        if (chats === 2) {
+          controller.abort();
+          throw new Error("aborted");
+        }
+      }
+      return baseFetch(input, init);
+    }) as unknown as typeof fetch;
+    const events = await consume(
+      streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake", signal: controller.signal }),
+    );
+    const error = events.find((event) => event.type === "error") as { error: AssistantMessage };
+    expect(error.error.stopReason).toBe("aborted");
+    expect(error.error.usage.totalTokens).toBe(2);
+    expect(chats).toBe(2);
+    expect(events.some((event) => event.type === "toolcall_start")).toBe(false);
+  });
+
+  it("limits native malformed-argument retries to one", async () => {
+    const invalid =
+      sseEnvelope(
+        chunk({ tool_calls: [{ index: 0, id: "bad", function: { name: "bash", arguments: '{"command":' } }] }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const fetchMock = sequenceFetch([invalid, invalid]) as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+    const error = events.find((event) => event.type === "error") as { error: AssistantMessage };
+    expect(error.error.errorMessage).toContain("after one retry");
+    expect(error.error.usage.totalTokens).toBe(4);
+    expect(events.some((event) => event.type === "toolcall_start")).toBe(false);
+    expect(chatFetchCalls(fetchMock)).toBe(2);
+  });
+
+  it("retries malformed reasoning DSML even when upstream finishes with stop", async () => {
+    const first =
+      sseEnvelope(
+        chunk({
+          reasoning_content: "Need a tool.\n</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+        }),
+      ) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    const fetchMock = sequenceFetch([first, SUCCESS_SSE]) as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    expect(done).toBeDefined();
+    expect(chatFetchCalls(fetchMock)).toBe(2);
+    expect(JSON.stringify(done.message.content)).not.toMatch(/DSML|<\/invoke>|<\/parameter>/);
+  });
+
+  it("does not execute or retry a complete invoke draft in reasoning", async () => {
+    const draft = '<invoke name="bash">\n<parameter name="command">ls</parameter>\n</invoke>';
+    const first =
+      sseEnvelope(chunk({ reasoning_content: draft.slice(0, 40) })) +
+      sseEnvelope(chunk({ reasoning_content: draft.slice(40) })) +
+      sseEnvelope(chunk({ content: "Answer." })) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    const fetchMock = sequenceFetch([first]) as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    expect(done.message.content.some((block) => block.type === "toolCall")).toBe(false);
+    expect(chatFetchCalls(fetchMock)).toBe(1);
+  });
+
+  it.each([false, "off", undefined])("parses inline thinking even with reasoning=%s", async (reasoning) => {
+    const sse =
+      sseEnvelope(chunk({ reasoning_content: "<thi" })) +
+      sseEnvelope(chunk({ reasoning_content: "nk>native</think>" })) +
+      sseEnvelope(chunk({ content: "<think>first</think>before<thinking>second</thinking>after" })) +
+      sseEnvelope(finishChunk("stop")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(sse);
+    const options = { apiKey: "fake", reasoning } as unknown as Parameters<typeof streamQoder>[2];
+    const events = await consume(streamQoder(makeModel(), makeContext(), options));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    const thought = done.message.content.filter((block) => block.type === "thinking").map((block) => block.thinking);
+    const text = done.message.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("");
+    expect(thought).toEqual(["native", "first", "second"]);
+    expect(text).toBe("beforeafter");
+    for (const event of events) {
+      if ("contentIndex" in event) {
+        expect(done.message.content[event.contentIndex].type).toBe(
+          event.type.startsWith("thinking") ? "thinking" : "text",
+        );
+      }
+    }
+  });
+
+  it("preserves summary tags rather than silently discarding the response", async () => {
+    const text = "<analysis>analysis</analysis><summary>summary</summary>";
+    globalThis.fetch = mockFetch(sseEnvelope(chunk({ content: text })) + sseEnvelope(finishChunk("stop")) + DONE_SSE);
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage };
+    expect(done.message.content).toEqual([{ type: "text", text }]);
+  });
+
+  it("logs summary diagnostics without recording private prompt contents", async () => {
+    vi.spyOn(debugLog, "isQoderDebugEnabled").mockReturnValue(true);
+    const logged = vi.spyOn(debugLog, "logDebug").mockImplementation(() => {});
+    const text = "<analysis>private-response</analysis><summary>summary</summary>";
+    globalThis.fetch = mockFetch(sseEnvelope(chunk({ content: text })) + sseEnvelope(finishChunk("stop")) + DONE_SSE);
+    const context = normalizeContext({
+      systemPrompt: "Create a detailed summary. token=private-system-token",
+      messages: [{ role: "user", content: "Bearer private-user-token", timestamp: 1 }],
+    });
+    const events = await consume(streamQoder(makeModel(), context, { apiKey: "fake" }));
+    expect(events.some((event) => event.type === "done")).toBe(true);
+    const request = logged.mock.calls.find(([level]) => level === "request-snapshot");
+    const response = logged.mock.calls.find(([level]) => level === "summary-response");
+    expect(request).toBeDefined();
+    expect(response).toBeDefined();
+    expect(JSON.stringify(request)).toContain("detailed-summary");
+    expect(JSON.stringify(logged.mock.calls)).not.toContain("private-");
   });
 
   it("rejects a tool_calls finish reason when no tool call was emitted", async () => {

@@ -29,15 +29,14 @@ import { withQoderHttpTimeout } from "./http.js";
 import { prepareQoderRequest } from "./prepare.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { fitQoderImagesToBudget } from "./request-budget.js";
-import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
+import { describeQoderMessages, describeQoderText } from "./request-diagnostics.js";
+import { ThinkingTagParser, ThinkingTagStripper } from "./thinking-parser.js";
 
 interface ToolCallState {
   arguments: string;
   id: string;
   name: string;
-  emittedStart?: boolean;
-  emittedEnd?: boolean;
-  contentIndex: number;
+  error?: string;
 }
 
 function logStreamDebug(event: string, details: Record<string, unknown>): void {
@@ -278,7 +277,11 @@ export function streamQoder(
 
       stream.push({ type: "start", partial: output });
 
-      const attemptOnce = async (): Promise<{ malformed: boolean; malformedText: string }> => {
+      const attemptOnce = async (): Promise<{
+        malformed: boolean;
+        malformedText: string;
+        failedToolCalls: ToolCallState[];
+      }> => {
         output.stopReason = "stop";
         delete output.errorMessage;
         // Inner AbortController so both the caller's signal and an idle timeout
@@ -329,7 +332,9 @@ export function streamQoder(
             // Qoder's server ignores the top-level `system` field; inject the system
             // prompt as a leading role:system message instead, which it honors.
             system: "",
-            messages: systemText ? [{ role: "system" as const, content: systemText }, ...requestMessages] : requestMessages,
+            messages: systemText
+              ? [{ role: "system" as const, content: systemText }, ...requestMessages]
+              : requestMessages,
             tools: toolsRaw || [],
             parameters: {
               max_tokens: maxTokens,
@@ -375,6 +380,15 @@ export function streamQoder(
             stream.push({ type: "text_start", contentIndex, partial: output });
             stream.push({ type: "text_delta", contentIndex, delta: notice, partial: output });
             stream.push({ type: "text_end", contentIndex, content: notice, partial: output });
+          }
+          if (isQoderDebugEnabled()) {
+            logDebug("request-snapshot", {
+              requestId,
+              isRetry: malformedRetryCount > 0,
+              model: qoderModel,
+              parameters: reqBody.parameters,
+              messages: describeQoderMessages(messages),
+            });
           }
           const encodedBody = qoderEncodeBody(bodyBytes);
           const encodedBytes = Buffer.from(encodedBody, "utf8");
@@ -470,13 +484,12 @@ export function streamQoder(
               "Qoder 模型长时间未返回响应（可能积分已用完或服务繁忙），已中止本次请求。请检查 Qoder 账户额度或稍后重试。",
             );
 
-          let contentBlockIndex = -1;
           let thinkingBlockIndex = -1;
           const toolCallsState: ToolCallState[] = [];
-
-          const thinkingEnabled =
-            (options?.reasoning as unknown) !== false && (options?.reasoning as unknown) !== "off";
-          const thinkingParser = thinkingEnabled ? new ThinkingTagParser(output, stream) : null;
+          const dsmlToolCalls: ToolCall[] = [];
+          // Upstream can still send inline thinking when thinking is disabled.
+          const thinkingParser = new ThinkingTagParser(output, stream);
+          const reasoningTagStripper = new ThinkingTagStripper();
 
           const endApiThinking = () => {
             if (thinkingBlockIndex === -1) return;
@@ -493,23 +506,7 @@ export function streamQoder(
           const appendText = (text: string) => {
             if (!text) return;
             endApiThinking();
-            if (thinkingParser) {
-              thinkingParser.processChunk(text);
-              return;
-            }
-            if (contentBlockIndex === -1) {
-              contentBlockIndex = output.content.length;
-              output.content.push({ type: "text", text: "" });
-              stream.push({ type: "text_start", contentIndex: contentBlockIndex, partial: output });
-            }
-            const block = output.content[contentBlockIndex] as TextContent;
-            block.text += text;
-            stream.push({
-              type: "text_delta",
-              contentIndex: contentBlockIndex,
-              delta: text,
-              partial: output,
-            });
+            thinkingParser.processChunk(text);
           };
 
           const appendThinking = (text: string) => {
@@ -535,43 +532,15 @@ export function streamQoder(
               name,
               argumentChars: JSON.stringify(args).length,
             });
-            if (toolCallsState.length >= MAX_TOOL_CALLS) {
+            if (dsmlToolCalls.length + toolCallsState.filter(Boolean).length >= MAX_TOOL_CALLS) {
               throw new Error(`Qoder stream returned more than ${MAX_TOOL_CALLS} tool calls`);
             }
-            endApiThinking();
-            const index = toolCallsState.length;
-            const id = `dsml-${requestId}-${index}`;
-            const contentIndex = output.content.length;
-            const serializedArguments = JSON.stringify(args);
-            output.content.push({
+            dsmlToolCalls.push({
               type: "toolCall",
-              id,
+              id: `dsml-${requestId}-${dsmlToolCalls.length}`,
               name,
               arguments: args as ToolCall["arguments"],
-            } satisfies ToolCall);
-            stream.push({ type: "toolcall_start", contentIndex, partial: output });
-            if (serializedArguments !== "{}") {
-              stream.push({
-                type: "toolcall_delta",
-                contentIndex,
-                delta: serializedArguments,
-                partial: output,
-              });
-            }
-            stream.push({
-              type: "toolcall_end",
-              contentIndex,
-              toolCall: { type: "toolCall", id, name, arguments: args as ToolCall["arguments"] },
-              partial: output,
             });
-            toolCallsState[index] = {
-              arguments: serializedArguments,
-              id,
-              name,
-              emittedStart: true,
-              emittedEnd: true,
-              contentIndex,
-            };
           };
 
           const malformedDsml: string[] = [];
@@ -583,6 +552,7 @@ export function streamQoder(
           // just the model thinking out loud and must stay thinking text.
           const dsmlReasoningParser = new DsmlToolParser(appendThinking, emitDsmlTool, {
             incompleteOnly: true,
+            onMalformedInvocation: (raw) => malformedDsml.push(raw),
           });
 
           while (true) {
@@ -716,7 +686,7 @@ export function streamQoder(
                       eventNo: sseEventCount,
                       status,
                       body: envelope.body.slice(0, 500),
-                      sentMessages: reqBody.messages,
+                      sentMessages: describeQoderMessages(messages),
                     });
                   }
                   // A 10605 queue payload becomes a typed QoderQueueError so the
@@ -836,24 +806,30 @@ export function streamQoder(
                     }
                     // 1. Reasoning/thinking content (API reasoning channel)
                     if (delta.reasoning_content) {
-                      if (/<invoke|<parameter|<calls>|&lt;|\uFF5C|tool▁/i.test(delta.reasoning_content)) {
+                      if (
+                        isQoderDebugEnabled() &&
+                        /<invoke|<parameter|<calls>|&lt;|\uFF5C|tool▁/i.test(delta.reasoning_content)
+                      ) {
                         logStreamDebug("dsml-raw-reasoning", {
                           requestId,
                           eventNo: sseEventCount,
-                          content: delta.reasoning_content.slice(0, 600),
+                          content: describeQoderText(delta.reasoning_content),
                         });
                       }
-                      const reasoningChunk = stripThinkingTags(delta.reasoning_content);
+                      const reasoningChunk = reasoningTagStripper.push(delta.reasoning_content);
                       if (reasoningChunk) dsmlReasoningParser.push(reasoningChunk);
                     }
 
                     // 2. Text content and Qoder's XML/DSML tool-call fallback
                     if (delta.content) {
-                      if (/<invoke|<parameter|<calls>|&lt;|\uFF5C|tool▁/i.test(delta.content)) {
+                      if (
+                        isQoderDebugEnabled() &&
+                        /<invoke|<parameter|<calls>|&lt;|\uFF5C|tool▁/i.test(delta.content)
+                      ) {
                         logStreamDebug("dsml-raw", {
                           requestId,
                           eventNo: sseEventCount,
-                          content: delta.content.slice(0, 600),
+                          content: describeQoderText(delta.content),
                         });
                       }
                       dsmlParser.push(delta.content);
@@ -875,7 +851,10 @@ export function streamQoder(
                           throw new Error(`Qoder stream returned more than ${MAX_TOOL_CALLS} tool calls`);
                         }
                         if (!toolCallsState[idx]) {
-                          toolCallsState[idx] = { arguments: "", id: "", name: "", contentIndex: 0 };
+                          if (toolCallsState.filter(Boolean).length + dsmlToolCalls.length >= MAX_TOOL_CALLS) {
+                            throw new Error(`Qoder stream returned more than ${MAX_TOOL_CALLS} tool calls`);
+                          }
+                          toolCallsState[idx] = { arguments: "", id: "", name: "" };
                         }
                         const state = toolCallsState[idx];
                         if (tc.id !== undefined && typeof tc.id !== "string") {
@@ -890,37 +869,6 @@ export function streamQoder(
                         }
                         if (tc.function?.name) state.name = tc.function.name;
 
-                        // Open the block as soon as the call is IDENTIFIABLE, not when
-                        // its first argument byte arrives. A no-argument tool used to
-                        // create no content block, making the finalizer claim "toolUse"
-                        // on a message carrying no tool call, dead-ending the turn.
-                        if (state.emittedStart === undefined && (state.id || state.name)) {
-                          state.emittedStart = true;
-                          state.contentIndex = output.content.length;
-                          output.content.push({
-                            type: "toolCall",
-                            id: state.id,
-                            name: state.name,
-                            arguments: {},
-                          } satisfies ToolCall);
-                          stream.push({ type: "toolcall_start", contentIndex: state.contentIndex, partial: output });
-                          if (state.arguments) {
-                            stream.push({
-                              type: "toolcall_delta",
-                              contentIndex: state.contentIndex,
-                              delta: state.arguments,
-                              partial: output,
-                            });
-                          }
-                        }
-
-                        // id/name can arrive after the block is open; keep it in step.
-                        if (state.emittedStart) {
-                          const block = output.content[state.contentIndex] as ToolCall;
-                          block.id = state.id;
-                          block.name = state.name;
-                        }
-
                         if (tc.function?.arguments !== undefined && typeof tc.function.arguments !== "string") {
                           throw new Error("Qoder SSE payload has non-string tool arguments");
                         }
@@ -930,14 +878,6 @@ export function streamQoder(
                             throw new Error(`Qoder tool arguments exceeded ${MAX_TOOL_ARGUMENT_CHARS} characters`);
                           }
                           state.arguments += argDelta;
-                          if (state.emittedStart) {
-                            stream.push({
-                              type: "toolcall_delta",
-                              contentIndex: state.contentIndex,
-                              delta: argDelta,
-                              partial: output,
-                            });
-                          }
                         }
                       }
                     }
@@ -1008,61 +948,72 @@ export function streamQoder(
             }
           }
 
+          dsmlReasoningParser.push(reasoningTagStripper.finish());
           dsmlParser.finish();
           dsmlReasoningParser.finish();
-          if (thinkingParser) thinkingParser.finalize();
+          endApiThinking();
+          thinkingParser.finalize();
 
-          if (thinkingBlockIndex !== -1) {
-            const block = output.content[thinkingBlockIndex] as ThinkingContent;
-            stream.push({
-              type: "thinking_end",
-              contentIndex: thinkingBlockIndex,
-              content: block.thinking,
-              partial: output,
-            });
-          }
-
-          for (const state of toolCallsState) {
-            if (state?.emittedStart && !state.emittedEnd) {
-              state.emittedEnd = true;
-              let args: Record<string, unknown> = {};
-              const rawArguments = state.arguments.trim();
-              if (rawArguments) {
-                const parsedArguments: unknown = JSON.parse(rawArguments);
-                if (!isRecord(parsedArguments)) {
-                  throw new Error("Qoder stream returned non-object tool arguments");
-                }
-                args = parsedArguments;
-              }
-              const block = output.content[state.contentIndex] as ToolCall;
-              block.arguments = args as ToolCall["arguments"];
-              stream.push({
-                type: "toolcall_end",
-                contentIndex: state.contentIndex,
-                toolCall: {
-                  type: "toolCall",
-                  id: state.id,
-                  name: state.name,
-                  arguments: args as ToolCall["arguments"],
-                },
-                partial: output,
+          const nativeCalls: ToolCall[] = [];
+          const invalidNativeCalls: ToolCallState[] = [];
+          const unidentifiedToolArguments: string[] = [];
+          for (const [index, state] of toolCallsState.entries()) {
+            if (!state) continue;
+            if (!state.name) {
+              if (state.id || state.arguments) unidentifiedToolArguments.push(JSON.stringify(state));
+              continue;
+            }
+            state.id ||= `call-${requestId}-${index}`;
+            try {
+              const parsed: unknown = state.arguments.trim() ? JSON.parse(state.arguments) : {};
+              if (!isRecord(parsed)) throw new Error("Tool arguments must be a JSON object");
+              state.arguments = JSON.stringify(parsed);
+              nativeCalls.push({
+                type: "toolCall",
+                id: state.id,
+                name: state.name,
+                arguments: parsed as ToolCall["arguments"],
               });
+            } catch (error) {
+              state.error = describeError(error);
+              invalidNativeCalls.push(state);
             }
           }
 
-          const hasToolCalls = toolCallsState.some((state) => state?.emittedStart);
-          const unidentifiedToolArguments = toolCallsState
-            .filter((state) => state && !state.emittedStart && state.arguments.length > 0)
-            .map((state) => state.arguments);
-          // Guard on blocks that actually reached the message, not on the state array.
-          if (hasToolCalls) {
-            output.stopReason = "toolUse";
-          }
+          const calls = [...dsmlToolCalls, ...nativeCalls];
           const malformed =
-            !hasToolCalls &&
-            (output.stopReason === "toolUse" || malformedDsml.length > 0 || unidentifiedToolArguments.length > 0);
+            invalidNativeCalls.length > 0 ||
+            malformedDsml.length > 0 ||
+            unidentifiedToolArguments.length > 0 ||
+            (calls.length === 0 && output.stopReason === "toolUse");
           const malformedText = [...malformedDsml, ...unidentifiedToolArguments].join("\n");
+          // Do not emit any executable tool block until the entire batch validates.
+          // A malformed sibling must not execute valid calls twice after a retry.
+          if (!malformed) {
+            if (calls.length > MAX_TOOL_CALLS) {
+              throw new Error(`Qoder stream returned more than ${MAX_TOOL_CALLS} tool calls`);
+            }
+            for (const call of calls) {
+              const contentIndex = output.content.length;
+              output.content.push(call);
+              stream.push({ type: "toolcall_start", contentIndex, partial: output });
+              const args = JSON.stringify(call.arguments);
+              if (args !== "{}") stream.push({ type: "toolcall_delta", contentIndex, delta: args, partial: output });
+              stream.push({ type: "toolcall_end", contentIndex, toolCall: call, partial: output });
+            }
+            if (calls.length > 0) output.stopReason = "toolUse";
+          }
 
+          if (isQoderDebugEnabled()) {
+            const text = output.content
+              .filter((block): block is TextContent => block.type === "text")
+              .map((block) => block.text)
+              .join("");
+            const diagnostic = describeQoderText(text);
+            if (diagnostic.tags.summary || diagnostic.tags.analysis) {
+              logDebug("summary-response", { requestId, reason: output.stopReason, ...diagnostic });
+            }
+          }
           logStreamDebug("attempt-complete", {
             requestId,
             reason: output.stopReason,
@@ -1075,7 +1026,20 @@ export function streamQoder(
             contentBlocks: output.content.length,
             usage: output.usage,
           });
-          return { malformed, malformedText };
+          return {
+            malformed,
+            malformedText,
+            failedToolCalls: malformed
+              ? [
+                  ...toolCallsState.filter((state) => state?.name),
+                  ...dsmlToolCalls.map((call) => ({
+                    id: call.id,
+                    name: call.name,
+                    arguments: JSON.stringify(call.arguments),
+                  })),
+                ]
+              : [],
+          };
         } catch (error) {
           logStreamDebug("attempt-error", {
             requestId,
@@ -1117,7 +1081,7 @@ export function streamQoder(
           if (result.malformed) {
             if (!toolsRaw?.length) {
               throw new Error(
-                output.stopReason === "toolUse"
+                output.stopReason === "toolUse" && result.failedToolCalls.length === 0 && !result.malformedText
                   ? "Qoder stream returned tool_calls finish reason without a tool call"
                   : "Qoder returned an unparseable tool call without a tool call retry capability",
               );
@@ -1126,17 +1090,45 @@ export function streamQoder(
               throw new Error("Qoder returned an unparseable tool call after one retry");
             }
 
-            const assistantText = output.content
-              .map((block, index) => {
-                if (imageNoticeIndexes.has(index) || index === queueNoticeIndex) return "";
-                if (block.type === "text") return block.text;
-                if (block.type === "thinking") return `<thinking>${block.thinking}</thinking>`;
-                return "";
-              })
+            const responseBlocks = output.content.filter(
+              (_, index) => !imageNoticeIndexes.has(index) && index !== queueNoticeIndex,
+            );
+            const assistantText = responseBlocks
+              .filter((block): block is TextContent => block.type === "text")
+              .map((block) => block.text)
+              .join("");
+            const assistantReasoning = responseBlocks
+              .filter((block): block is ThinkingContent => block.type === "thinking")
+              .map((block) => block.thinking)
               .join("");
             const malformedResponse = assistantText + result.malformedText;
             requestMessages = [...requestMessages];
-            if (malformedResponse) requestMessages.push({ role: "assistant", content: malformedResponse });
+            if (malformedResponse || assistantReasoning || result.failedToolCalls.length > 0) {
+              requestMessages.push({
+                role: "assistant",
+                content: malformedResponse || " ",
+                ...(assistantReasoning ? { reasoning_content: assistantReasoning } : {}),
+                ...(result.failedToolCalls.length > 0
+                  ? {
+                      tool_calls: result.failedToolCalls.map((state) => ({
+                        id: state.id,
+                        type: "function" as const,
+                        function: { name: state.name, arguments: state.arguments },
+                      })),
+                    }
+                  : {}),
+              });
+            }
+            // Exactly one feedback message per abandoned call; none was executed.
+            for (const state of result.failedToolCalls) {
+              requestMessages.push({
+                role: "tool",
+                tool_call_id: state.id,
+                content: state.error
+                  ? "Tool call was not executed: arguments are not a valid JSON object. Please correct the arguments."
+                  : "Tool call was not executed because another call in the same response was malformed. Please retry.",
+              });
+            }
             requestMessages.push({ role: "user", content: MALFORMED_TOOL_RETRY_PROMPT });
             requestLastUserText = MALFORMED_TOOL_RETRY_PROMPT;
             malformedRetryCount += 1;

@@ -1,6 +1,6 @@
 import type { Api, AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { stripThinkingTags, ThinkingTagParser } from "../thinking-parser.js";
+import { stripThinkingTags, ThinkingTagParser, ThinkingTagStripper } from "../thinking-parser.js";
 
 function createMockStream() {
   const events: AssistantMessageEvent[] = [];
@@ -56,6 +56,83 @@ describe("ThinkingTagParser", () => {
     expect(output.content[0]).toMatchObject({ type: "text", text: "Hello world" });
   });
 
+  it("extracts repeated and mixed thinking variants without changing emitted indexes", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("before<think>first</think>middle<thinking>second</thinking>after");
+    parser.finalize();
+
+    expect(output.content).toEqual([
+      { type: "text", text: "before" },
+      { type: "thinking", thinking: "first" },
+      { type: "text", text: "middle" },
+      { type: "thinking", thinking: "second" },
+      { type: "text", text: "after" },
+    ]);
+    for (const [event] of pushMock.mock.calls) {
+      if ("contentIndex" in event) {
+        const expectedType = event.type.startsWith("thinking") ? "thinking" : "text";
+        expect(output.content[event.contentIndex].type).toBe(expectedType);
+      }
+    }
+    expect(pushMock.mock.calls.filter(([event]) => event.type === "text_end")).toHaveLength(3);
+    expect(pushMock.mock.calls.filter(([event]) => event.type === "thinking_end")).toHaveLength(2);
+  });
+
+  it("keeps ordinary thinking/response words intact at every chunk boundary", () => {
+    const input = "I am thinking about the response.";
+    for (let split = 1; split < input.length; split++) {
+      const result = createOutput();
+      const parser = new ThinkingTagParser(result, createMockStream().stream);
+      parser.processChunk(input.slice(0, split));
+      parser.processChunk(input.slice(split));
+      parser.finalize();
+      expect(result.content).toEqual([{ type: "text", text: input }]);
+      const stripper = new ThinkingTagStripper();
+      expect(stripper.push(input.slice(0, split)) + stripper.push(input.slice(split)) + stripper.finish()).toBe(input);
+    }
+  });
+
+  it("keeps ordinary bare words in prose after an XML thinking block", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("<think>thought</think>I am thinking about the response.");
+    parser.finalize();
+    expect(output.content).toEqual([
+      { type: "thinking", thinking: "thought" },
+      { type: "text", text: "I am thinking about the response." },
+    ]);
+  });
+
+  it("recognizes think tags split at every possible boundary", () => {
+    const input = "<think>thought</think>answer";
+    for (let split = 1; split < input.length; split++) {
+      const result = createOutput();
+      const parser = new ThinkingTagParser(result, createMockStream().stream);
+      parser.processChunk(input.slice(0, split));
+      parser.processChunk(input.slice(split));
+      parser.finalize();
+      expect(result.content).toEqual([
+        { type: "thinking", thinking: "thought" },
+        { type: "text", text: "answer" },
+      ]);
+    }
+  });
+
+  it("closes an unfinished thinking block even when its buffer is empty", () => {
+    const parser = new ThinkingTagParser(output, stream);
+    parser.processChunk("<think>unfinished");
+    parser.finalize();
+    expect(pushMock.mock.calls.filter(([event]) => event.type === "thinking_end")).toHaveLength(1);
+  });
+
+  it("strips reasoning wrappers split at every possible boundary", () => {
+    const input = "<think>thought</think><thinking>more</thinking>";
+    for (let split = 1; split < input.length; split++) {
+      const stripper = new ThinkingTagStripper();
+      const text = stripper.push(input.slice(0, split)) + stripper.push(input.slice(split)) + stripper.finish();
+      expect(text).toBe("thoughtmore");
+    }
+  });
+
   it("handles empty input", () => {
     const parser = new ThinkingTagParser(output, stream);
     parser.finalize();
@@ -68,8 +145,8 @@ describe("ThinkingTagParser", () => {
     parser.finalize();
 
     expect(output.content).toHaveLength(3);
-    expect(output.content[0]).toMatchObject({ type: "thinking", thinking: "reasoning here" });
-    expect(output.content[1]).toMatchObject({ type: "text", text: "Hello " });
+    expect(output.content[0]).toMatchObject({ type: "text", text: "Hello " });
+    expect(output.content[1]).toMatchObject({ type: "thinking", thinking: "reasoning here" });
     expect(output.content[2]).toMatchObject({ type: "text", text: " world" });
   });
 
@@ -88,8 +165,8 @@ describe("ThinkingTagParser", () => {
     parser.finalize();
 
     expect(output.content).toHaveLength(3);
-    expect(output.content[0]).toMatchObject({ type: "thinking", thinking: "reasoning" });
-    expect(output.content[1]).toMatchObject({ type: "text", text: "Hello " });
+    expect(output.content[0]).toMatchObject({ type: "text", text: "Hello " });
+    expect(output.content[1]).toMatchObject({ type: "thinking", thinking: "reasoning" });
     expect(output.content[2]).toMatchObject({ type: "text", text: " world" });
   });
 
@@ -120,8 +197,8 @@ describe("ThinkingTagParser", () => {
     parser.finalize();
 
     expect(output.content).toHaveLength(3);
-    expect(output.content[0]).toMatchObject({ type: "thinking", thinking: "part1 part2" });
-    expect(output.content[1]).toMatchObject({ type: "text", text: "Hello " });
+    expect(output.content[0]).toMatchObject({ type: "text", text: "Hello " });
+    expect(output.content[1]).toMatchObject({ type: "thinking", thinking: "part1 part2" });
     expect(output.content[2]).toMatchObject({ type: "text", text: " world" });
   });
 
@@ -132,8 +209,8 @@ describe("ThinkingTagParser", () => {
     parser.finalize();
 
     expect(output.content).toHaveLength(2);
-    expect(output.content[0]).toMatchObject({ type: "thinking", thinking: "body" });
-    expect(output.content[1]).toMatchObject({ type: "text", text: "text " });
+    expect(output.content[0]).toMatchObject({ type: "text", text: "text " });
+    expect(output.content[1]).toMatchObject({ type: "thinking", thinking: "body" });
   });
 
   it("handles text ending with partial tag prefix (flushes on finalize)", () => {

@@ -34,6 +34,7 @@ type QoderContent = string | Array<QoderTextPart | QoderImagePart>;
 interface QoderMessage {
   role: "user" | "assistant" | "tool" | "system";
   content: QoderContent | null;
+  reasoning_content?: string;
   tool_calls?: QoderToolCall[];
   tool_call_id?: string;
 }
@@ -109,6 +110,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
     } else if (msg.role === "assistant") {
       const am = msg as AssistantMessage;
       let content = "";
+      let reasoning = "";
       const toolCalls: QoderToolCall[] = [];
 
       if (Array.isArray(am.content)) {
@@ -116,7 +118,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
           if (block.type === "text") {
             content += (block as TextContent).text;
           } else if (block.type === "thinking") {
-            content += `<thinking>${(block as ThinkingContent).thinking}</thinking>\n\n`;
+            reasoning += (block as ThinkingContent).thinking;
           } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
             toolCalls.push({
@@ -135,11 +137,16 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
 
       // Qoder's gateway drops assistant messages whose content is null, which
       // orphans the following tool_result. When an assistant turn has tool calls
-      // but no text/thinking, inject a single-space placeholder.
+      // but no visible text, inject a single-space placeholder.
       const mapped: QoderMessage = {
         role: "assistant",
         content: content || (toolCalls.length > 0 ? " " : null),
       };
+      if (reasoning) {
+        mapped.reasoning_content = reasoning;
+        // The gateway also needs non-null content for thinking-only turns.
+        if (mapped.content === null) mapped.content = " ";
+      }
       if (toolCalls.length > 0) {
         mapped.tool_calls = toolCalls;
         for (const tc of toolCalls) {
@@ -205,7 +212,7 @@ export function transformMessagesForQoder(messages: Message[]): QoderMessage[] {
       continue;
     }
     const content = typeof m.content === "string" ? m.content : "";
-    if (content.trim() === "") {
+    if (content.trim() === "" && !m.reasoning_content?.trim()) {
       if (process.env.QODER_DEBUG) {
         logDebug("transform", "dropped assistant message with unanswered tool calls (interrupted turn)");
       }

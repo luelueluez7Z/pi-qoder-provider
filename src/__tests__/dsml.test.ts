@@ -217,6 +217,40 @@ describe("DsmlToolParser", () => {
   });
 
   describe("incompleteOnly (reasoning channel)", () => {
+    it("does not retry or execute complete drafts, including split parameters", () => {
+      const draft = '<invoke name="bash">\n<parameter name="command">ls</parameter>\n</invoke>';
+      for (let split = 1; split < draft.length; split++) {
+        const text: string[] = [];
+        const tools: unknown[] = [];
+        const malformed: string[] = [];
+        const parser = new DsmlToolParser(
+          (value) => text.push(value),
+          (tool) => tools.push(tool),
+          { incompleteOnly: true, onMalformedInvocation: (raw) => malformed.push(raw) },
+        );
+        parser.push(draft.slice(0, split));
+        parser.push(draft.slice(split));
+        parser.finish();
+        expect(text.join("")).toBe(draft);
+        expect(tools).toEqual([]);
+        expect(malformed).toEqual([]);
+      }
+    });
+
+    it("reports orphan closing tags in reasoning without displaying them", () => {
+      const text: string[] = [];
+      const malformed: string[] = [];
+      const parser = new DsmlToolParser(
+        (value) => text.push(value),
+        () => { throw new Error("must not execute"); },
+        { incompleteOnly: true, onMalformedInvocation: (raw) => malformed.push(raw) },
+      );
+      parser.push("thinking\n</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>");
+      parser.finish();
+      expect(text.join("")).toBe("thinking\n");
+      expect(malformed).toHaveLength(1);
+    });
+
     it("recovers a degenerate invocation", () => {
       const text: string[] = [];
       const tools: unknown[] = [];

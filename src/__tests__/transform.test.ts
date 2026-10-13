@@ -162,8 +162,51 @@ describe("transformMessagesForQoder", () => {
       },
     ] as unknown as Message[];
     const result = transformMessagesForQoder(msgs);
-    expect(result[0].content).toContain("<thinking>let me think</thinking>");
-    expect(result[0].content).toContain("answer");
+    expect(result[0].content).toBe("answer");
+    expect(result[0].reasoning_content).toBe("let me think");
+  });
+
+  it("keeps multiple thinking blocks separate from text and preserves tool pairing", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "first" },
+          { type: "text", text: "answer" },
+          { type: "thinking", thinking: "second" },
+          { type: "toolCall", id: "call_1", name: "read", arguments: { path: "x" } },
+        ],
+      },
+      { role: "toolResult", toolCallId: "call_1", content: "result" },
+    ] as unknown as Message[];
+    const result = transformMessagesForQoder(messages);
+    expect(result[0]).toMatchObject({ content: "answer", reasoning_content: "firstsecond" });
+    expect(result[0].tool_calls?.[0].id).toBe("call_1");
+    expect(result[1].tool_call_id).toBe("call_1");
+  });
+
+  it("keeps thinking-only content even when an unanswered call is removed", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "retained thought" },
+          { type: "toolCall", id: "orphan", name: "read", arguments: {} },
+        ],
+      },
+    ] as unknown as Message[];
+    expect(transformMessagesForQoder(messages)).toEqual([
+      { role: "assistant", content: " ", reasoning_content: "retained thought" },
+    ]);
+  });
+
+  it("does not rewrite literal tags already present in ordinary text", () => {
+    const messages = [
+      { role: "assistant", content: [{ type: "text", text: "Example: <think>thought</think>" }] },
+    ] as unknown as Message[];
+    expect(transformMessagesForQoder(messages)).toEqual([
+      { role: "assistant", content: "Example: <think>thought</think>" },
+    ]);
   });
 
   it("handles toolResult messages", () => {

@@ -151,6 +151,7 @@ export interface DsmlToolParserOptions {
 export class DsmlToolParser {
   private textBuffer = "";
   private invocationBuffer: string | undefined;
+  private draftBuffer: string | undefined;
   private orphanCloseCandidate = false;
 
   constructor(
@@ -172,6 +173,11 @@ export class DsmlToolParser {
 
   finish(): void {
     this.textBuffer = normalizeDsmlVariants(this.textBuffer);
+    if (this.draftBuffer !== undefined) {
+      this.emitText(normalizeDsmlVariants(this.draftBuffer + this.textBuffer));
+      this.draftBuffer = undefined;
+      this.textBuffer = "";
+    }
     if (this.invocationBuffer !== undefined) {
       this.invocationBuffer += this.textBuffer;
       this.textBuffer = "";
@@ -196,6 +202,18 @@ export class DsmlToolParser {
   private drain(): void {
     this.textBuffer = normalizeDsmlVariants(this.textBuffer);
     while (true) {
+      // Reasoning drafts must not be executed or mistaken for malformed calls,
+      // including when parameters and the closing tag arrive in later chunks.
+      if (this.draftBuffer !== undefined) {
+        this.draftBuffer = normalizeDsmlVariants(this.draftBuffer + this.textBuffer);
+        this.textBuffer = "";
+        const end = this.draftBuffer.indexOf(INVOKE_END);
+        if (end < 0) return;
+        this.emitText(this.draftBuffer.slice(0, end + INVOKE_END.length));
+        this.textBuffer = this.draftBuffer.slice(end + INVOKE_END.length);
+        this.draftBuffer = undefined;
+        continue;
+      }
       if (this.invocationBuffer !== undefined) {
         this.invocationBuffer += this.textBuffer;
         this.textBuffer = "";
@@ -233,14 +251,13 @@ export class DsmlToolParser {
         continue;
       }
 
-      if (!this.options.incompleteOnly) {
-        const invokeMatch = this.textBuffer.match(/<invoke(?:\s|>)/i);
-        if (invokeMatch?.index !== undefined) {
-          this.emitText(this.textBuffer.slice(0, invokeMatch.index));
-          this.invocationBuffer = this.textBuffer.slice(invokeMatch.index);
-          this.textBuffer = "";
-          continue;
-        }
+      const invokeMatch = this.textBuffer.match(/<invoke(?:\s|>)/i);
+      if (invokeMatch?.index !== undefined) {
+        this.emitText(this.textBuffer.slice(0, invokeMatch.index));
+        if (this.options.incompleteOnly) this.draftBuffer = this.textBuffer.slice(invokeMatch.index);
+        else this.invocationBuffer = this.textBuffer.slice(invokeMatch.index);
+        this.textBuffer = "";
+        continue;
       }
 
       // Degenerate invocation: parameters with no `<invoke>` opener. Only
