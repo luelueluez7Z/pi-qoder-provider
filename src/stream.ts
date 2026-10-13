@@ -28,6 +28,7 @@ import { type DsmlToolCall, DsmlToolParser } from "./dsml.js";
 import { withQoderHttpTimeout } from "./http.js";
 import { prepareQoderRequest } from "./prepare.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
+import { fitQoderImagesToBudget } from "./request-budget.js";
 import { stripThinkingTags, ThinkingTagParser } from "./thinking-parser.js";
 
 interface ToolCallState {
@@ -269,6 +270,7 @@ export function streamQoder(
       // original friendly QoderQueueError message surfaces to the user.
       const queueRetryMax = parseQueueRetryMax();
       let queueNoticeIndex: number | null = null;
+      const imageNoticeIndexes = new Set<number>();
       let requestMessages = normalizedMessages;
       let requestLastUserText = lastUserText;
       let malformedRetryCount = 0;
@@ -306,7 +308,7 @@ export function streamQoder(
         try {
           if (options?.signal?.aborted) throw new Error("aborted");
           requestId = crypto.randomUUID();
-          const reqBody: Record<string, unknown> = {
+          const reqBody = {
             request_id: requestId,
             request_set_id: recordID,
             chat_record_id: recordID,
@@ -327,7 +329,7 @@ export function streamQoder(
             // Qoder's server ignores the top-level `system` field; inject the system
             // prompt as a leading role:system message instead, which it honors.
             system: "",
-            messages: systemText ? [{ role: "system", content: systemText }, ...requestMessages] : requestMessages,
+            messages: systemText ? [{ role: "system" as const, content: systemText }, ...requestMessages] : requestMessages,
             tools: toolsRaw || [],
             parameters: {
               max_tokens: maxTokens,
@@ -362,9 +364,17 @@ export function streamQoder(
           };
 
           if (options?.signal?.aborted) throw new Error("aborted");
-          const bodyBytes = Buffer.from(JSON.stringify(reqBody));
-          if (bodyBytes.byteLength > MAX_REQUEST_BODY_BYTES) {
-            throw new Error(`Qoder request body exceeded ${MAX_REQUEST_BODY_BYTES} bytes`);
+          const { bodyBytes, messages, omittedImages } = fitQoderImagesToBudget(reqBody, MAX_REQUEST_BODY_BYTES);
+          // Reuse the fitted history on queue/malformed retries instead of restoring old images.
+          requestMessages = systemText ? messages.slice(1) : messages;
+          if (omittedImages > 0) {
+            const contentIndex = output.content.length;
+            const notice = `⚠️ 请求体过大，本次请求已省略 ${omittedImages} 张较旧图片，保留文本和最新图片。建议 /compact。\n\n`;
+            imageNoticeIndexes.add(contentIndex);
+            output.content.push({ type: "text", text: notice });
+            stream.push({ type: "text_start", contentIndex, partial: output });
+            stream.push({ type: "text_delta", contentIndex, delta: notice, partial: output });
+            stream.push({ type: "text_end", contentIndex, content: notice, partial: output });
           }
           const encodedBody = qoderEncodeBody(bodyBytes);
           const encodedBytes = Buffer.from(encodedBody, "utf8");
@@ -374,8 +384,9 @@ export function streamQoder(
             sessionId: sessionID,
             model: qoderModel,
             bodyBytes: bodyBytes.byteLength,
+            omittedImages,
             encodedBytes: encodedBytes.byteLength,
-            messageCount: Array.isArray(reqBody.messages) ? reqBody.messages.length : 0,
+            messageCount: messages.length,
             toolCount: Array.isArray(reqBody.tools) ? reqBody.tools.length : 0,
           });
 
@@ -1116,14 +1127,15 @@ export function streamQoder(
             }
 
             const assistantText = output.content
-              .map((block) => {
+              .map((block, index) => {
+                if (imageNoticeIndexes.has(index) || index === queueNoticeIndex) return "";
                 if (block.type === "text") return block.text;
                 if (block.type === "thinking") return `<thinking>${block.thinking}</thinking>`;
                 return "";
               })
               .join("");
             const malformedResponse = assistantText + result.malformedText;
-            requestMessages = [...normalizedMessages];
+            requestMessages = [...requestMessages];
             if (malformedResponse) requestMessages.push({ role: "assistant", content: malformedResponse });
             requestMessages.push({ role: "user", content: MALFORMED_TOOL_RETRY_PROMPT });
             requestLastUserText = MALFORMED_TOOL_RETRY_PROMPT;
@@ -1155,7 +1167,8 @@ export function streamQoder(
           queueAttemptCount += 1;
           // Only retry when nothing real has been produced yet — a queue error
           // arriving after content started would duplicate the reply.
-          const realContentCount = queueNoticeIndex === null ? output.content.length : output.content.length - 1;
+          const realContentCount =
+            output.content.length - imageNoticeIndexes.size - (queueNoticeIndex === null ? 0 : 1);
           if (realContentCount > 0 || queueAttemptCount > queueRetryMax) throw e;
 
           const waitSec = e.queue.retryAfterSeconds ?? 30;

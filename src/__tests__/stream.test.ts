@@ -274,6 +274,84 @@ describe("streamQoder", () => {
     expect(text && "text" in text ? text.text : "").toBe("OK");
   });
 
+  it("fits oversized image history and preserves it across queue and malformed retries", async () => {
+    const context = normalizeContext({
+      systemPrompt: "test",
+      tools: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} } as never }],
+      messages: [
+        { role: "user", content: "inspect", timestamp: 1 },
+        {
+          role: "assistant",
+          api: "qoder-api" as Api,
+          provider: "qoder",
+          model: "ultimate",
+          stopReason: "toolUse",
+          timestamp: 2,
+          usage: {} as AssistantMessage["usage"],
+          content: [{ type: "toolCall", id: "read-image", name: "read", arguments: {} }],
+        },
+        {
+          role: "toolResult",
+          toolCallId: "read-image",
+          toolName: "read",
+          timestamp: 3,
+          isError: false,
+          content: [
+            { type: "text", text: "Screenshot paths preserved" },
+            { type: "image", data: "a".repeat(17 * 1024 * 1024), mimeType: "image/png" },
+            { type: "image", data: "latest-image", mimeType: "image/png" },
+          ],
+        },
+      ],
+    });
+    const originalImage = "a".repeat(17 * 1024 * 1024);
+    const malformed = sseEnvelope(finishChunk("tool_calls")) + DONE_SSE;
+    const fetchMock = sequenceFetch([QUEUED_SSE, malformed, SUCCESS_SSE]);
+    globalThis.fetch = fetchMock;
+    process.env.QODER_QUEUE_RETRY_MAX = "1";
+
+    const events = await consume(streamQoder(makeModel(), context, { apiKey: "fake" }));
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage } | undefined;
+    expect(done).toBeDefined();
+    const notices = done?.message.content.filter(
+      (block) => block.type === "text" && block.text.includes("本次请求已省略"),
+    );
+    expect(notices).toHaveLength(1);
+    expect(notices?.[0]).toMatchObject({ text: expect.stringContaining("1 张") });
+
+    const calls = (fetchMock as unknown as ReturnType<typeof vi.fn>).mock.calls.filter((call) => {
+      return !String(call[0]).includes("/userinfo") && !String(call[0]).includes("/quota/usage");
+    });
+    expect(calls).toHaveLength(3);
+    for (const call of calls) {
+      const decoded = decodeQoderBody(Buffer.from(call[1].body).toString("utf8"));
+      expect(Buffer.byteLength(decoded)).toBeLessThanOrEqual(16 * 1024 * 1024);
+      const body = JSON.parse(decoded);
+      expect(body.messages.some((m: { tool_call_id?: string }) => m.tool_call_id === "read-image")).toBe(true);
+      expect(decoded).toContain("Screenshot paths preserved");
+      expect(decoded).toContain("data:image/png;base64,latest-image");
+      expect(decoded).toContain("Earlier image omitted");
+      expect(decoded).not.toContain("本次请求已省略");
+    }
+    const toolResult = context.messages.find((message) => message.role === "toolResult");
+    expect(toolResult?.content.find((block) => block.type === "image")).toMatchObject({ data: originalImage });
+    expect(events.filter((event) => event.type === "text_end").length).toBeGreaterThan(0);
+  });
+
+  it("reports /compact advice without sending an oversized text-only chat request", async () => {
+    const context = normalizeContext({
+      systemPrompt: "test",
+      tools: [],
+      messages: [{ role: "user", content: "x".repeat(17 * 1024 * 1024), timestamp: 1 }],
+    });
+    const fetchMock = mockFetch(SUCCESS_SSE);
+    globalThis.fetch = fetchMock;
+    const events = await consume(streamQoder(makeModel(), context, { apiKey: "fake" }));
+    const error = events.find((event) => event.type === "error") as { error: AssistantMessage } | undefined;
+    expect(error?.error.errorMessage).toContain("/compact");
+    expect(chatFetchCalls(fetchMock as unknown as ReturnType<typeof vi.fn>)).toBe(0);
+  });
+
   it("retries an unparseable DSML tool call once without streaming the malformed fragment", async () => {
     const malformedDsml = "</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>";
     const malformedResponse =
