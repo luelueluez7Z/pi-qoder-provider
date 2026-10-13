@@ -163,9 +163,38 @@ const MAX_SSE_BUFFER_CHARS = 8 * 1024 * 1024;
 const MAX_TOOL_ARGUMENT_CHARS = 1 * 1024 * 1024;
 const MAX_TOOL_CALLS = 128;
 const MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+const MALFORMED_TOOL_RETRY_PROMPT = "Your tool call was malformed and could not be parsed. Please retry.";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function emptyUsage(): AssistantMessage["usage"] {
+  return {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function cloneUsage(usage: AssistantMessage["usage"]): AssistantMessage["usage"] {
+  return { ...usage, cost: { ...usage.cost } };
+}
+
+function addUsage(target: AssistantMessage["usage"], source: AssistantMessage["usage"]): void {
+  target.input += source.input;
+  target.output += source.output;
+  target.cacheRead += source.cacheRead;
+  target.cacheWrite += source.cacheWrite;
+  target.totalTokens += source.totalTokens;
+  target.cost.input += source.cost.input;
+  target.cost.output += source.cost.output;
+  target.cost.cacheRead += source.cost.cacheRead;
+  target.cost.cacheWrite += source.cost.cacheWrite;
+  target.cost.total += source.cost.total;
 }
 
 export function streamQoder(
@@ -194,6 +223,15 @@ export function streamQoder(
   };
 
   (async () => {
+    let previousMalformedUsage: AssistantMessage["usage"] | undefined;
+    let previousMalformedUsageMerged = false;
+    const mergePreviousMalformedUsage = () => {
+      if (previousMalformedUsage && !previousMalformedUsageMerged) {
+        addUsage(output.usage, previousMalformedUsage);
+        previousMalformedUsageMerged = true;
+      }
+    };
+
     try {
       // Prelude: identity, quota, model key, replayed messages, tools and
       // generation parameters.
@@ -231,10 +269,16 @@ export function streamQoder(
       // original friendly QoderQueueError message surfaces to the user.
       const queueRetryMax = parseQueueRetryMax();
       let queueNoticeIndex: number | null = null;
+      let requestMessages = normalizedMessages;
+      let requestLastUserText = lastUserText;
+      let malformedRetryCount = 0;
+      let queueAttemptCount = 0;
 
       stream.push({ type: "start", partial: output });
 
-      const attemptOnce = async (): Promise<void> => {
+      const attemptOnce = async (): Promise<{ malformed: boolean; malformedText: string }> => {
+        output.stopReason = "stop";
+        delete output.errorMessage;
         // Inner AbortController so both the caller's signal and an idle timeout
         // (hung upstream, e.g. quota exhausted) can tear the fetch down.
         const attemptStartedAt = Date.now();
@@ -270,7 +314,7 @@ export function streamQoder(
             stream: true,
             chat_task: "FREE_INPUT",
             is_reply: true,
-            is_retry: false,
+            is_retry: malformedRetryCount > 0,
             source: 1,
             version: "3",
             session_type: "qodercli",
@@ -283,9 +327,7 @@ export function streamQoder(
             // Qoder's server ignores the top-level `system` field; inject the system
             // prompt as a leading role:system message instead, which it honors.
             system: "",
-            messages: systemText
-              ? [{ role: "system", content: systemText }, ...normalizedMessages]
-              : normalizedMessages,
+            messages: systemText ? [{ role: "system", content: systemText }, ...requestMessages] : requestMessages,
             tools: toolsRaw || [],
             parameters: {
               max_tokens: maxTokens,
@@ -302,10 +344,10 @@ export function streamQoder(
                   key: qoderModel,
                   is_reasoning: isReasoning,
                 },
-                originalContent: lastUserText,
+                originalContent: requestLastUserText,
               },
               features: [],
-              text: lastUserText,
+              text: requestLastUserText,
             },
             model_config: modelConfig,
             business: {
@@ -314,7 +356,7 @@ export function streamQoder(
               type: "agent",
               stage: "start",
               id: crypto.randomUUID(),
-              name: lastUserText.substring(0, 30),
+              name: requestLastUserText.substring(0, 30),
               begin_at: Date.now(),
             },
           };
@@ -521,7 +563,10 @@ export function streamQoder(
             };
           };
 
-          const dsmlParser = new DsmlToolParser(appendText, emitDsmlTool);
+          const malformedDsml: string[] = [];
+          const dsmlParser = new DsmlToolParser(appendText, emitDsmlTool, {
+            onMalformedInvocation: (raw) => malformedDsml.push(raw),
+          });
           // The reasoning channel only ever carries *degenerate* DSML (the
           // opener got stripped upstream); a complete `<invoke>` draft there is
           // just the model thinking out loud and must stay thinking text.
@@ -995,20 +1040,23 @@ export function streamQoder(
           }
 
           const hasToolCalls = toolCallsState.some((state) => state?.emittedStart);
-          if (toolCallsState.some((state) => state && !state.emittedStart && state.arguments.length > 0)) {
-            throw new Error("Qoder stream returned tool arguments without a tool call identity");
-          }
-          if (output.stopReason === "toolUse" && !hasToolCalls) {
-            throw new Error("Qoder stream returned tool_calls finish reason without a tool call");
-          }
+          const unidentifiedToolArguments = toolCallsState
+            .filter((state) => state && !state.emittedStart && state.arguments.length > 0)
+            .map((state) => state.arguments);
           // Guard on blocks that actually reached the message, not on the state array.
           if (hasToolCalls) {
             output.stopReason = "toolUse";
           }
+          const malformed =
+            !hasToolCalls &&
+            (output.stopReason === "toolUse" || malformedDsml.length > 0 || unidentifiedToolArguments.length > 0);
+          const malformedText = [...malformedDsml, ...unidentifiedToolArguments].join("\n");
 
-          logStreamDebug("done", {
+          logStreamDebug("attempt-complete", {
             requestId,
             reason: output.stopReason,
+            malformed,
+            malformedChars: malformedText.length,
             elapsedMs: Date.now() - attemptStartedAt,
             readCount,
             totalReadBytes,
@@ -1016,12 +1064,7 @@ export function streamQoder(
             contentBlocks: output.content.length,
             usage: output.usage,
           });
-          stream.push({
-            type: "done",
-            reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
-            message: output,
-          });
-          stream.end();
+          return { malformed, malformedText };
         } catch (error) {
           logStreamDebug("attempt-error", {
             requestId,
@@ -1055,20 +1098,65 @@ export function streamQoder(
         }
       };
 
-      // Retry loop: on a QoderQueueError, surface a live notice, wait the
-      // server-suggested duration, then re-issue the request.
-      let attemptCount = 0;
+      // Retry malformed tool calls once with Qoder CLI's corrective user message.
+      // Ordinary text stays streamed; only the malformed DSML fragment is withheld.
       while (true) {
-        attemptCount += 1;
         try {
-          await attemptOnce();
+          const result = await attemptOnce();
+          if (result.malformed) {
+            if (!toolsRaw?.length) {
+              throw new Error(
+                output.stopReason === "toolUse"
+                  ? "Qoder stream returned tool_calls finish reason without a tool call"
+                  : "Qoder returned an unparseable tool call without a tool call retry capability",
+              );
+            }
+            if (malformedRetryCount >= 1) {
+              throw new Error("Qoder returned an unparseable tool call after one retry");
+            }
+
+            const assistantText = output.content
+              .map((block) => {
+                if (block.type === "text") return block.text;
+                if (block.type === "thinking") return `<thinking>${block.thinking}</thinking>`;
+                return "";
+              })
+              .join("");
+            const malformedResponse = assistantText + result.malformedText;
+            requestMessages = [...normalizedMessages];
+            if (malformedResponse) requestMessages.push({ role: "assistant", content: malformedResponse });
+            requestMessages.push({ role: "user", content: MALFORMED_TOOL_RETRY_PROMPT });
+            requestLastUserText = MALFORMED_TOOL_RETRY_PROMPT;
+            malformedRetryCount += 1;
+
+            previousMalformedUsage = cloneUsage(output.usage);
+            previousMalformedUsageMerged = false;
+            output.usage = emptyUsage();
+            output.responseId = undefined;
+            output.responseModel = undefined;
+            logStreamDebug("malformed-tool-retry", {
+              retry: malformedRetryCount,
+              malformedChars: result.malformedText.length,
+              responseChars: malformedResponse.length,
+            });
+            continue;
+          }
+
+          mergePreviousMalformedUsage();
+          stream.push({
+            type: "done",
+            reason: output.stopReason as Extract<AssistantMessage["stopReason"], "stop" | "length" | "toolUse">,
+            message: output,
+          });
+          stream.end();
           break;
         } catch (e) {
           if (!(e instanceof QoderQueueError)) throw e;
+          queueAttemptCount += 1;
           // Only retry when nothing real has been produced yet — a queue error
           // arriving after content started would duplicate the reply.
           const realContentCount = queueNoticeIndex === null ? output.content.length : output.content.length - 1;
-          if (realContentCount > 0 || attemptCount > queueRetryMax) throw e;
+          if (realContentCount > 0 || queueAttemptCount > queueRetryMax) throw e;
 
           const waitSec = e.queue.retryAfterSeconds ?? 30;
           const modelLabel = e.modelName || e.queue.modelKey || "当前模型";
@@ -1076,7 +1164,7 @@ export function streamQoder(
             typeof e.queue.queueCount === "number" && e.queue.queueCount > 0
               ? `（队列约 ${e.queue.queueCount} 个请求）`
               : "";
-          const line = `⏳ ${modelLabel} 排队中${queuePart}，预计等待约 ${waitSec} 秒，正在自动重试（第 ${attemptCount}/${queueRetryMax} 次）…`;
+          const line = `⏳ ${modelLabel} 排队中${queuePart}，预计等待约 ${waitSec} 秒，正在自动重试（第 ${queueAttemptCount}/${queueRetryMax} 次）…`;
           if (queueNoticeIndex === null) {
             queueNoticeIndex = output.content.length;
             output.content.push({ type: "text", text: line });
@@ -1090,6 +1178,7 @@ export function streamQoder(
         }
       }
     } catch (e: unknown) {
+      mergePreviousMalformedUsage();
       logStreamDebug("turn-error", {
         error: describeError(e),
         errorDetails: describeErrorDetails(e),

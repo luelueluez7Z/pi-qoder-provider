@@ -62,6 +62,23 @@ describe("DsmlToolParser", () => {
     ]);
   });
 
+  it("recovers a double-fullwidth-pipe DSML invocation", () => {
+    const text: string[] = [];
+    const tools: unknown[] = [];
+    const parser = new DsmlToolParser(
+      (value) => text.push(value),
+      (tool) => tools.push(tool),
+    );
+
+    parser.push(
+      '<parameter name="command">Get-ChildItem</parameter>\n</invoke>\n</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>',
+    );
+    parser.finish();
+
+    expect(text.join("")).toBe("");
+    expect(tools).toEqual([{ name: "powershell", arguments: { command: "Get-ChildItem" } }]);
+  });
+
   it("recovers a degenerate invocation split across deltas", () => {
     const text: string[] = [];
     const tools: unknown[] = [];
@@ -81,19 +98,57 @@ describe("DsmlToolParser", () => {
     expect(text.join("")).toBe("then real text");
   });
 
-  it("keeps a degenerate invocation with un-inferrable parameters as text", () => {
+  it("captures orphaned double-fullwidth-pipe DSML closing tags as malformed tool output", () => {
     const text: string[] = [];
-    const tools: unknown[] = [];
+    const malformed: string[] = [];
     const parser = new DsmlToolParser(
       (value) => text.push(value),
-      (tool) => tools.push(tool),
+      () => {
+        throw new Error("unexpected tool call");
+      },
+      { onMalformedInvocation: (raw) => malformed.push(raw) },
     );
 
-    parser.push('<parameter name="widget">x</parameter>\n</invoke>\n</invoke>');
+    parser.push("safe preamble</｜｜DSML｜｜ parameter>");
+    parser.push(" </｜｜DSML｜｜ invoke>");
+    parser.push(" </｜｜DSML｜｜ calls>");
     parser.finish();
 
-    expect(tools).toEqual([]);
-    expect(text.join("")).toBe('<parameter name="widget">x</parameter>\n</invoke>\n</invoke>');
+    expect(text.join("")).toBe("safe preamble");
+    expect(malformed).toEqual(["</parameter> </invoke> </calls>"]);
+  });
+
+  it("keeps an unparseable invocation as text when retry handling is not configured", () => {
+    const text: string[] = [];
+    const parser = new DsmlToolParser(
+      (value) => text.push(value),
+      () => {
+        throw new Error("unexpected tool call");
+      },
+    );
+
+    parser.push('<parameter name="widget">x</parameter>\n</invoke>');
+    parser.finish();
+
+    expect(text.join("")).toBe('<parameter name="widget">x</parameter>\n</invoke>');
+  });
+
+  it("reports an unparseable invocation so the caller can retry without exposing DSML", () => {
+    const text: string[] = [];
+    const malformed: string[] = [];
+    const parser = new DsmlToolParser(
+      (value) => text.push(value),
+      () => {
+        throw new Error("unexpected tool call");
+      },
+      { onMalformedInvocation: (raw) => malformed.push(raw) },
+    );
+
+    parser.push('safe preamble\n<parameter name="widget">x</parameter>\n</invoke>');
+    parser.finish();
+
+    expect(malformed).toEqual(['<parameter name="widget">x</parameter>\n</invoke>']);
+    expect(text.join("")).toBe("safe preamble\n");
   });
 
   it("keeps mid-line parameter tags in prose as text", () => {
@@ -111,7 +166,7 @@ describe("DsmlToolParser", () => {
     expect(text.join("")).toBe('use the <parameter name="x"> tag carefully');
   });
 
-  it("normalizes ｜DSML｜-wrapped complete invocations", () => {
+  it("still normalizes single-fullwidth-pipe DSML wrappers", () => {
     const text: string[] = [];
     const tools: unknown[] = [];
     const parser = new DsmlToolParser(
@@ -121,6 +176,23 @@ describe("DsmlToolParser", () => {
 
     parser.push(
       '<｜DSML｜ invoke name="bash"><｜DSML｜ parameter name="command">ls</｜DSML｜ parameter></｜DSML｜ invoke>',
+    );
+    parser.finish();
+
+    expect(text.join("")).toBe("");
+    expect(tools).toEqual([{ name: "bash", arguments: { command: "ls" } }]);
+  });
+
+  it("normalizes double-fullwidth-pipe DSML-wrapped complete invocations", () => {
+    const text: string[] = [];
+    const tools: unknown[] = [];
+    const parser = new DsmlToolParser(
+      (value) => text.push(value),
+      (tool) => tools.push(tool),
+    );
+
+    parser.push(
+      '<｜｜DSML｜｜ invoke name="bash"><｜｜DSML｜｜ parameter name="command">ls</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke>',
     );
     parser.finish();
 

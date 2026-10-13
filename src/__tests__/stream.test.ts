@@ -8,7 +8,7 @@ import type {
   TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { streamQoder } from "../stream.js";
 import { resetQoderQuotaCache } from "../usage.js";
 
@@ -203,6 +203,43 @@ function makeContext(): TranscriptContext {
   });
 }
 
+function makeContextWithTools(): TranscriptContext {
+  return normalizeContext({
+    systemPrompt: "test",
+    messages: [{ role: "user", content: "hi", timestamp: Date.now() }],
+    tools: [
+      {
+        name: "bash",
+        description: "Run a shell command",
+        parameters: {
+          type: "object",
+          properties: { command: { type: "string" } },
+          required: ["command"],
+        } as never,
+      },
+    ],
+  });
+}
+
+function decodeQoderBody(encoded: string): string {
+  const custom = "_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!";
+  const standard = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const decoded = new Array<string>(encoded.length);
+  const segmentLength = Math.floor(encoded.length / 3);
+  for (let i = 0; i < encoded.length; i++) {
+    const sourceIndex =
+      i < segmentLength
+        ? encoded.length - segmentLength + i
+        : i < encoded.length - segmentLength
+          ? i
+          : i - (encoded.length - segmentLength);
+    const char = encoded[i];
+    const alphabetIndex = custom.indexOf(char);
+    decoded[sourceIndex] = char === "$" ? "=" : alphabetIndex >= 0 ? standard[alphabetIndex] : char;
+  }
+  return Buffer.from(decoded.join(""), "base64").toString("utf8");
+}
+
 async function consume(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {
   const events: AssistantMessageEvent[] = [];
   for await (const ev of stream) {
@@ -235,6 +272,83 @@ describe("streamQoder", () => {
     expect(msg.stopReason).toBe("stop");
     const text = msg.content.find((c) => c.type === "text");
     expect(text && "text" in text ? text.text : "").toBe("OK");
+  });
+
+  it("retries an unparseable DSML tool call once without streaming the malformed fragment", async () => {
+    const malformedDsml = "</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>";
+    const malformedResponse =
+      sseEnvelope(chunk({ content: `Let me check the logs.\n${malformedDsml}`, role: "assistant" })) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const validToolResponse =
+      sseEnvelope(
+        chunk({
+          tool_calls: [
+            { index: 0, id: "call-retry", function: { name: "bash", arguments: '{"command":"Get-ChildItem"}' } },
+          ],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const fetchMock = sequenceFetch([malformedResponse, validToolResponse]);
+    const fetchMockCalls = fetchMock as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage } | undefined;
+    expect(done).toBeDefined();
+    expect(done?.message.stopReason).toBe("toolUse");
+    expect(done?.message.usage.totalTokens).toBe(4);
+    expect(done?.message.content.some((block) => block.type === "toolCall")).toBe(true);
+    const visibleText = done?.message.content
+      .filter((block): block is Extract<typeof block, { type: "text" }> => block.type === "text")
+      .map((block) => block.text)
+      .join("");
+    expect(visibleText).toContain("Let me check the logs.");
+    expect(visibleText).not.toContain("<invoke>");
+
+    const chatCalls = fetchMockCalls.mock.calls.filter((call) => {
+      const url = String(call[0]);
+      return !url.includes("/userinfo") && !url.includes("/quota/usage");
+    });
+    expect(chatCalls).toHaveLength(2);
+    const secondBody = Buffer.from(chatCalls[1][1]?.body as Buffer).toString("utf8");
+    const retryRequest = JSON.parse(decodeQoderBody(secondBody));
+    expect(retryRequest.is_retry).toBe(true);
+    expect(retryRequest.messages.at(-2)).toEqual({
+      role: "assistant",
+      content: "Let me check the logs.\n</parameter>\n</invoke>\n</calls>",
+    });
+    expect(retryRequest.messages.at(-1)).toEqual({
+      role: "user",
+      content: "Your tool call was malformed and could not be parsed. Please retry.",
+    });
+  });
+
+  it("does not retry a malformed tool call more than once", async () => {
+    const malformedResponse =
+      sseEnvelope(
+        chunk({
+          content: "</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>\n</｜｜DSML｜｜ calls>",
+          role: "assistant",
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    const fetchMock = sequenceFetch([malformedResponse, malformedResponse]);
+    const fetchMockCalls = fetchMock as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock;
+
+    const events = await consume(streamQoder(makeModel(), makeContextWithTools(), { apiKey: "fake" }));
+
+    const error = events.find((event) => event.type === "error") as { error: AssistantMessage } | undefined;
+    expect(error?.error.errorMessage).toContain("after one retry");
+    const chatCalls = fetchMockCalls.mock.calls.filter((call) => {
+      const url = String(call[0]);
+      return !url.includes("/userinfo") && !url.includes("/quota/usage");
+    });
+    expect(chatCalls).toHaveLength(2);
   });
 
   it.each([

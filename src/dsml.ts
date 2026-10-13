@@ -4,9 +4,9 @@ export interface DsmlToolCall {
 }
 
 const INVOKE_END = "</invoke>";
-// Qoder occasionally tokenizes DSML tags with a `｜DSML｜` (U+FF5C) wrapper,
-// e.g. `<｜DSML｜ invoke name="bash">` / `</｜DSML｜ invoke>`; normalizeDsmlVariants
-// rewrites them into plain XML tags.
+// Qoder occasionally tokenizes DSML tags with one or more `｜` (U+FF5C)
+// characters around `DSML`, e.g. `<｜｜DSML｜｜ invoke name="bash">`;
+// normalizeDsmlVariants rewrites them into plain XML tags.
 
 const PARAMETER_PATTERN = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter\s*>/gi;
 const TRAILING_CLOSES_PATTERN = /^(?:\s*<\/(?:parameter|invoke|calls)\s*>)+\s*/i;
@@ -27,12 +27,12 @@ function decodeXml(value: string): string {
     .replace(/&amp;/g, "&");
 }
 
-/** Rewrite `｜DSML｜`-wrapped tags into plain XML tags so the standard parsers can read them. */
+/** Rewrite `｜DSML｜` and `｜｜DSML｜｜`-wrapped tags into plain XML tags. */
 function normalizeDsmlVariants(text: string): string {
   if (!text.includes("\uFF5C")) return text;
   return text
-    .replace(/<\/\uFF5CDSML\uFF5C\s*(\w+)\s*>/g, "</$1>")
-    .replace(/<\uFF5CDSML\uFF5C\s*(\w+)([^>]*)>/g, "<$1$2>");
+    .replace(/<\/\uFF5C+DSML\uFF5C+\s*(\w+)\s*>/g, "</$1>")
+    .replace(/<\uFF5C+DSML\uFF5C+\s*(\w+)([^>]*)>/g, "<$1$2>");
 }
 
 function extractParameters(body: string): Record<string, unknown> | undefined {
@@ -108,6 +108,34 @@ function endsWithPartialTag(text: string): boolean {
   return lastOpen !== -1 && !text.slice(lastOpen).includes(">");
 }
 
+/** Keep trailing orphan closing tags intact until we know if they form a broken DSML call. */
+function isPotentialOrphanCloseSequence(value: string): boolean {
+  let complete = value;
+  let partial = "";
+  if (endsWithPartialTag(value)) {
+    const lastOpen = value.lastIndexOf("<");
+    complete = value.slice(0, lastOpen);
+    partial = value.slice(lastOpen);
+  }
+  if (!/<\/(?:parameter|invoke)\s*>/i.test(complete)) return false;
+  if (!/^(?:\s*<\/(?:parameter|invoke|calls)\s*>)+\s*$/i.test(complete)) return false;
+  return !partial || /^<\/(?:parameter|invoke|calls)?[\w\s/]*$/i.test(partial);
+}
+
+function findOrphanCloseSuffixStart(value: string): number | undefined {
+  for (const match of value.matchAll(/<\/(?:parameter|invoke)\s*>/gi)) {
+    if (match.index !== undefined && isPotentialOrphanCloseSequence(value.slice(match.index))) {
+      return match.index;
+    }
+  }
+  return undefined;
+}
+
+function orphanCloseSequenceLength(value: string): number | undefined {
+  const match = value.match(/^\s*(?:<\/parameter\s*>\s*)?<\/invoke\s*>(?:\s*<\/calls\s*>)?/i);
+  return match?.[0].includes(INVOKE_END) ? match[0].length : undefined;
+}
+
 export interface DsmlToolParserOptions {
   /**
    * Only recover degenerate (opener-less) invocations. Used for the reasoning
@@ -115,12 +143,15 @@ export interface DsmlToolParserOptions {
    * out loud and must stay thinking text.
    */
   incompleteOnly?: boolean;
+  /** Called instead of emitting text when a DSML invocation candidate cannot be parsed. */
+  onMalformedInvocation?: (raw: string) => void;
 }
 
 /** Converts Qoder's occasional XML/DSML tool calls into pi tool-call events. */
 export class DsmlToolParser {
   private textBuffer = "";
   private invocationBuffer: string | undefined;
+  private orphanCloseCandidate = false;
 
   constructor(
     private readonly emitText: (text: string) => void,
@@ -134,6 +165,11 @@ export class DsmlToolParser {
     this.drain();
   }
 
+  private emitUnparsedInvocation(raw: string): void {
+    if (this.options.onMalformedInvocation) this.options.onMalformedInvocation(raw);
+    else this.emitText(raw);
+  }
+
   finish(): void {
     this.textBuffer = normalizeDsmlVariants(this.textBuffer);
     if (this.invocationBuffer !== undefined) {
@@ -141,12 +177,17 @@ export class DsmlToolParser {
       this.textBuffer = "";
       this.invocationBuffer = normalizeDsmlVariants(this.invocationBuffer);
       let tool: DsmlToolCall | undefined;
-      if (this.invocationBuffer.includes(INVOKE_END)) {
-        tool = parseInvocation(this.invocationBuffer) ?? parseIncompleteInvocation(this.invocationBuffer);
+      if (this.orphanCloseCandidate && !this.invocationBuffer.includes(INVOKE_END)) {
+        this.emitText(this.invocationBuffer);
+      } else {
+        if (this.invocationBuffer.includes(INVOKE_END)) {
+          tool = parseInvocation(this.invocationBuffer) ?? parseIncompleteInvocation(this.invocationBuffer);
+        }
+        if (tool) this.emitTool(tool);
+        else this.emitUnparsedInvocation(this.invocationBuffer);
       }
-      if (tool) this.emitTool(tool);
-      else this.emitText(this.invocationBuffer);
       this.invocationBuffer = undefined;
+      this.orphanCloseCandidate = false;
     }
     this.emitText(this.textBuffer);
     this.textBuffer = "";
@@ -159,6 +200,18 @@ export class DsmlToolParser {
         this.invocationBuffer += this.textBuffer;
         this.textBuffer = "";
         this.invocationBuffer = normalizeDsmlVariants(this.invocationBuffer);
+        if (this.orphanCloseCandidate && !isPotentialOrphanCloseSequence(this.invocationBuffer)) {
+          const closeSequenceLength = orphanCloseSequenceLength(this.invocationBuffer);
+          if (closeSequenceLength !== undefined) {
+            this.emitUnparsedInvocation(this.invocationBuffer.slice(0, closeSequenceLength));
+            this.textBuffer = this.invocationBuffer.slice(closeSequenceLength);
+          } else {
+            this.emitText(this.invocationBuffer);
+          }
+          this.invocationBuffer = undefined;
+          this.orphanCloseCandidate = false;
+          continue;
+        }
         const end = this.invocationBuffer.indexOf(INVOKE_END);
         if (end < 0) return;
         // Wait while only whitespace/closing tags follow (or a split close
@@ -172,10 +225,11 @@ export class DsmlToolParser {
           this.emitTool(tool);
           this.textBuffer = this.invocationBuffer.slice(end + INVOKE_END.length).replace(TRAILING_CLOSES_PATTERN, "");
         } else {
-          this.emitText(raw);
+          this.emitUnparsedInvocation(raw);
           this.textBuffer = this.invocationBuffer.slice(end + INVOKE_END.length);
         }
         this.invocationBuffer = undefined;
+        this.orphanCloseCandidate = false;
         continue;
       }
 
@@ -201,6 +255,15 @@ export class DsmlToolParser {
           this.textBuffer = "";
           continue;
         }
+      }
+
+      const orphanCloseStart = findOrphanCloseSuffixStart(this.textBuffer);
+      if (orphanCloseStart !== undefined) {
+        this.emitText(this.textBuffer.slice(0, orphanCloseStart));
+        this.invocationBuffer = this.textBuffer.slice(orphanCloseStart);
+        this.textBuffer = "";
+        this.orphanCloseCandidate = true;
+        continue;
       }
 
       const keepFrom = partialTagStart(this.textBuffer);
