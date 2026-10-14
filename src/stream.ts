@@ -26,6 +26,7 @@ import {
 import { isQoderDebugEnabled, logDebug } from "./debug-log.js";
 import { type DsmlToolCall, DsmlToolParser } from "./dsml.js";
 import { withQoderHttpTimeout } from "./http.js";
+import { waitForQoderEnvironmentLogin } from "./oauth.js";
 import { prepareQoderRequest } from "./prepare.js";
 import { qoderEncodeBody } from "./qoder-encoding.js";
 import { fitQoderImagesToBudget } from "./request-budget.js";
@@ -233,9 +234,20 @@ export function streamQoder(
     };
 
     try {
+      // Usually the before_agent_start hook has already waited before Pi reads
+      // auth.json. Keep the same guard for direct stream callers, and prefer the
+      // newly persisted PAT credentials if Pi captured the prior credential.
+      let effectiveOptions = options;
+      try {
+        const loginCredentials = await waitForQoderEnvironmentLogin(model.provider);
+        if (loginCredentials?.access) effectiveOptions = { ...options, apiKey: loginCredentials.access };
+      } catch {
+        // Fall back to the credential Pi resolved before the background login failed.
+      }
+
       // Prelude: identity, quota, model key, replayed messages, tools and
       // generation parameters.
-      const prepared = await prepareQoderRequest(model, context, options);
+      const prepared = await prepareQoderRequest(model, context, effectiveOptions);
       const {
         providerMode,
         accessToken,

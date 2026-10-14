@@ -46,6 +46,8 @@ const AUTH_FILE = join(homedir(), ".pi", "agent", "auth.json");
  * Never stores access/refresh.
  */
 const identityMemoryCache = new Map<string, QoderIdentity>();
+const environmentLoginPromises = new Map<string, Promise<QoderCredentials | undefined>>();
+const cancelEnvironmentLogins = new Map<string, () => void>();
 
 function hashAccessToken(accessToken: string): string {
   return createHash("sha256").update(accessToken).digest("hex");
@@ -114,22 +116,54 @@ function saveCredentialsToAuthFile(providerID: string, credentials: OAuthCredent
   }
 }
 
-/** Exchange an environment PAT before pi resolves its initial model. */
-export async function autoLoginQoderFromEnvironment(providerID: string, mode: string): Promise<void> {
+/** Exchange an environment PAT without blocking extension initialization. */
+export function autoLoginQoderFromEnvironment(providerID: string, mode: string): Promise<QoderCredentials | undefined> {
   const pat = getQoderPatForMode(mode);
-  if (!pat) return;
+  let cancelLogin: (() => void) | undefined;
+  const login = pat
+    ? (() => {
+        let cancel!: () => void;
+        const cancelled = new Promise<undefined>((resolve) => {
+          cancel = () => resolve(undefined);
+        });
+        cancelLogin = cancel;
+        cancelEnvironmentLogins.set(providerID, cancel);
 
-  // An explicitly supplied PAT is authoritative. Re-exchange on startup to avoid
-  // silently using an old account's credentials.
-  const credentials = await credentialsFromPat(pat, mode);
+        // An explicitly supplied PAT is authoritative. Re-exchange on startup to avoid
+        // silently using an old account's credentials. An explicit /login cancels the
+        // pending write so a slow startup exchange cannot overwrite the user's choice.
+        return Promise.race([credentialsFromPat(pat, mode), cancelled]).then((credentials) => {
+          if (!credentials) return undefined;
+          saveCredentialsToAuthFile(providerID, credentials);
+          const qCreds = credentials as QoderCredentials;
+          rememberQoderIdentity(providerID, qCreds);
+          return qCreds;
+        });
+      })()
+    : Promise.resolve(undefined);
 
-  saveCredentialsToAuthFile(providerID, credentials);
-  const qCreds = credentials as QoderCredentials;
-  rememberQoderIdentity(providerID, qCreds);
+  environmentLoginPromises.set(providerID, login);
+  void login.then(
+    () => {
+      if (environmentLoginPromises.get(providerID) === login) environmentLoginPromises.delete(providerID);
+      if (cancelEnvironmentLogins.get(providerID) === cancelLogin) cancelEnvironmentLogins.delete(providerID);
+    },
+    () => {
+      if (environmentLoginPromises.get(providerID) === login) environmentLoginPromises.delete(providerID);
+      if (cancelEnvironmentLogins.get(providerID) === cancelLogin) cancelEnvironmentLogins.delete(providerID);
+    },
+  );
+  return login;
+}
 
-  // Wait for the model cache before the provider is registered so `pi --list-models`
-  // sees the live catalog.
-  await updateQoderModelsCache(qCreds.access, qCreds.userID, qCreds.name, qCreds.email, mode);
+/** Cancel a pending environment login when the user explicitly starts /login. */
+export function cancelQoderEnvironmentLogin(providerID: string): void {
+  cancelEnvironmentLogins.get(providerID)?.();
+}
+
+/** Wait only when startup PAT exchange is in flight; used immediately before Qoder requests. */
+export function waitForQoderEnvironmentLogin(providerID: string): Promise<QoderCredentials | undefined> {
+  return environmentLoginPromises.get(providerID) ?? Promise.resolve(undefined);
 }
 
 /**

@@ -19,11 +19,14 @@ import {
 } from "./models.js";
 import {
   autoLoginQoderFromEnvironment,
+  cancelQoderEnvironmentLogin,
   loginQoder,
   loginQoderCN,
+  type QoderCredentials,
   refreshQoderToken,
   refreshQoderTokenCN,
   resolveQoderIdentity,
+  waitForQoderEnvironmentLogin,
 } from "./oauth.js";
 import { streamQoder } from "./stream.js";
 import { fetchQoderUsage, fetchQoderUsageCN } from "./usage.js";
@@ -101,7 +104,10 @@ function oauthDisplayName(providerID: string, mode: string): string {
 function createQoderOAuth(providerID: string, mode: string): OAuthConfigWithUsage {
   return {
     name: oauthDisplayName(providerID, mode),
-    login: isQoderCNMode(mode) ? loginQoderCN : loginQoder,
+    login: (callbacks) => {
+      cancelQoderEnvironmentLogin(providerID);
+      return (isQoderCNMode(mode) ? loginQoderCN : loginQoder)(callbacks);
+    },
     refreshToken: isQoderCNMode(mode) ? refreshQoderTokenCN : refreshQoderToken,
     getApiKey: (cred: OAuthCredentials) => cred.access,
     modifyModels: (models: Model<Api>[], _cred: OAuthCredentials) => {
@@ -118,59 +124,108 @@ function createQoderOAuth(providerID: string, mode: string): OAuthConfigWithUsag
 function modelConfigForProvider(
   mode: string,
   providerID: string,
-): Pick<ProviderConfig, "api" | "baseUrl" | "models" | "oauth" | "refreshModels"> {
+): Pick<ProviderConfig, "api" | "baseUrl" | "models" | "oauth" | "refreshModels" | "streamSimple"> {
   return {
     baseUrl: getQoderBaseUrl(mode),
     api: "qoder-api" as Api,
     models: modelsForProvider(mode, providerID) as unknown as ProviderConfig["models"],
     oauth: createQoderOAuth(providerID, mode) as ProviderConfig["oauth"],
     refreshModels: (context: RefreshModelsContext) => refreshQoderModels(mode, providerID, context),
+    streamSimple: streamQoder,
   };
 }
 
 function registerQoderProvider(pi: ExtensionAPI, providerID: string, mode: string): void {
-  pi.registerProvider(providerID, {
-    ...modelConfigForProvider(mode, providerID),
-    streamSimple: streamQoder,
-  });
+  pi.registerProvider(providerID, modelConfigForProvider(mode, providerID));
+}
+
+type QoderModelRegistry = {
+  getApiKeyForProvider(providerID: string): Promise<string | undefined>;
+  registerProvider(providerID: string, config: ProviderConfig): void;
+};
+
+const backgroundModelRefreshes = new Map<string, Promise<void>>();
+
+function refreshModelsInBackground(providerID: string, mode: string, registry: QoderModelRegistry): void {
+  if (backgroundModelRefreshes.has(providerID)) return;
+
+  const refresh = (async () => {
+    let loginCredentials: QoderCredentials | undefined;
+    try {
+      loginCredentials = await waitForQoderEnvironmentLogin(providerID);
+    } catch {
+      // A failed PAT exchange should not block use of an existing Pi credential.
+    }
+
+    const accessToken = loginCredentials?.access || (await registry.getApiKeyForProvider(providerID));
+    if (!accessToken) return;
+
+    const credentials = loginCredentials?.userID
+      ? loginCredentials
+      : await resolveQoderIdentity(accessToken, providerID, mode);
+    if (!credentials?.userID) return;
+
+    await updateQoderModelsCache(
+      accessToken,
+      credentials.userID,
+      credentials.name || (isQoderCNMode(mode) ? "Qoder CN User" : "Qoder User"),
+      credentials.email || getQoderUserEmailFallback(mode),
+      mode,
+    );
+    registry.registerProvider(providerID, modelConfigForProvider(mode, providerID));
+  })()
+    .catch(() => {
+      // Best-effort background refresh; retain the registered cache/static catalog.
+    })
+    .finally(() => {
+      backgroundModelRefreshes.delete(providerID);
+    });
+
+  backgroundModelRefreshes.set(providerID, refresh);
 }
 
 export default async function (pi: ExtensionAPI) {
-  for (const [providerID, mode] of [
+  const providers = [
     ["qoder", getQoderMode()],
     ["qoder-cn", "cn"],
-  ] as const) {
-    try {
-      await autoLoginQoderFromEnvironment(providerID, mode);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`[pi-provider-qoder] Automatic login failed for ${providerID}: ${message}`);
-    }
+  ] as const;
+  let activeModelRegistry: QoderModelRegistry | undefined;
+  const refreshAfterLogin = new Set<string>();
+
+  for (const [providerID, mode] of providers) {
+    void autoLoginQoderFromEnvironment(providerID, mode)
+      .then((credentials) => {
+        if (!credentials) return;
+        if (activeModelRegistry) refreshModelsInBackground(providerID, mode, activeModelRegistry);
+        else refreshAfterLogin.add(providerID);
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`[pi-provider-qoder] Automatic login failed for ${providerID}: ${message}`);
+      });
   }
 
-  // Refresh the models cache once per session at startup if it is missing or
-  // stale (>1h old), rather than on every message in the stream hot path.
-  pi.on("session_start", async (_event, ctx) => {
-    for (const [providerID, mode] of [
-      ["qoder", getQoderMode()],
-      ["qoder-cn", "cn"],
-    ] as const) {
-      try {
-        const accessToken = await ctx.modelRegistry.getApiKeyForProvider(providerID);
-        if (!accessToken || !isCacheStale(mode)) continue;
-        // Prefer auth.json, else /userinfo(access). Never use a placeholder userID.
-        const creds = await resolveQoderIdentity(accessToken, providerID, mode);
-        if (!creds?.userID) continue;
-        const userID = creds.userID;
-        const name = creds.name || (isQoderCNMode(mode) ? "Qoder CN User" : "Qoder User");
-        const email = creds.email || getQoderUserEmailFallback(mode);
-        await updateQoderModelsCache(accessToken, userID, name, email, mode);
-        // The provider was registered before session_start from the previous cache.
-        // Publish the refreshed snapshot immediately so the current model picker
-        // sees newly released models without restarting.
-        ctx.modelRegistry.registerProvider(providerID, modelConfigForProvider(mode, providerID));
-      } catch {
-        // Best-effort: fall back to the existing cache / static models.
+  // The credential store reloads auth.json by file revision on each request. Wait
+  // here (after startup, before Pi resolves credentials) so an immediate first
+  // Qoder request cannot race the asynchronous PAT exchange/write.
+  pi.on("before_agent_start", async (_event, ctx) => {
+    const providerID = ctx.model?.provider;
+    if (providerID !== "qoder" && providerID !== "qoder-cn") return;
+    try {
+      await waitForQoderEnvironmentLogin(providerID);
+    } catch {
+      // Preserve normal Pi auth behavior if the automatic login fails.
+    }
+  });
+
+  // Cache/network work is deliberately detached: Pi waits for this handler, so
+  // it must only schedule stale-cache refreshes, never await them.
+  pi.on("session_start", (_event, ctx) => {
+    activeModelRegistry = ctx.modelRegistry;
+    for (const [providerID, mode] of providers) {
+      const refreshAfterAutoLogin = refreshAfterLogin.delete(providerID);
+      if (refreshAfterAutoLogin || isCacheStale(mode)) {
+        refreshModelsInBackground(providerID, mode, ctx.modelRegistry);
       }
     }
   });
