@@ -68,13 +68,13 @@ export interface QoderModelDef {
 
 /**
  * Format a Qoder price factor (relative credit multiplier) for display, e.g.
- * `1` -> " · ×1", `1.6` -> " · ×1.6", `0` -> " · ×0". Returns "" when the
+ * `1` -> " 1", `1.6` -> " 1.6", `0` -> " 0". Returns "" when the
  * factor is unknown so the model name stays clean.
  */
 export function formatQoderPriceFactor(pf: number | undefined): string {
   if (pf === undefined || Number.isNaN(pf)) return "";
   const text = Number.isInteger(pf) ? String(pf) : pf.toFixed(2).replace(/\.?0+$/, "");
-  return ` · ×${text}`;
+  return ` ${text}`;
 }
 
 // ---------------------------------------------------------------------------

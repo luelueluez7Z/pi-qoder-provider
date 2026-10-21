@@ -118,12 +118,12 @@ describe("getCachedModelConfig", () => {
 
 describe("formatQoderPriceFactor", () => {
   it("formats integers and decimals compactly", () => {
-    expect(formatQoderPriceFactor(1)).toBe(" · ×1");
-    expect(formatQoderPriceFactor(0)).toBe(" · ×0");
-    expect(formatQoderPriceFactor(1.6)).toBe(" · ×1.6");
-    expect(formatQoderPriceFactor(0.3)).toBe(" · ×0.3");
-    expect(formatQoderPriceFactor(0.5)).toBe(" · ×0.5");
-    expect(formatQoderPriceFactor(3.2)).toBe(" · ×3.2");
+    expect(formatQoderPriceFactor(1)).toBe(" 1");
+    expect(formatQoderPriceFactor(0)).toBe(" 0");
+    expect(formatQoderPriceFactor(1.6)).toBe(" 1.6");
+    expect(formatQoderPriceFactor(0.3)).toBe(" 0.3");
+    expect(formatQoderPriceFactor(0.5)).toBe(" 0.5");
+    expect(formatQoderPriceFactor(3.2)).toBe(" 3.2");
   });
 
   it("returns empty string for unknown factors", () => {
