@@ -556,8 +556,16 @@ export function streamQoder(
           };
 
           const malformedDsml: string[] = [];
+          // Recover opener-less DSML names against the tool table this request
+          // actually declared, so the fallback does not guess a host tool that
+          // was never offered (or miss one whose schema changed).
+          const dsmlTools = toolsRaw?.map((tool) => ({
+            name: tool.function.name,
+            parameters: tool.function.parameters,
+          }));
           const dsmlParser = new DsmlToolParser(appendText, emitDsmlTool, {
             onMalformedInvocation: (raw) => malformedDsml.push(raw),
+            ...(dsmlTools ? { tools: dsmlTools } : {}),
           });
           // The reasoning channel only ever carries *degenerate* DSML (the
           // opener got stripped upstream); a complete `<invoke>` draft there is
@@ -565,6 +573,7 @@ export function streamQoder(
           const dsmlReasoningParser = new DsmlToolParser(appendThinking, emitDsmlTool, {
             incompleteOnly: true,
             onMalformedInvocation: (raw) => malformedDsml.push(raw),
+            ...(dsmlTools ? { tools: dsmlTools } : {}),
           });
 
           while (true) {
@@ -886,10 +895,23 @@ export function streamQoder(
                         }
                         if (tc.function?.arguments) {
                           const argDelta = tc.function.arguments;
-                          if (state.arguments.length + argDelta.length > MAX_TOOL_ARGUMENT_CHARS) {
+                          // Qoder sometimes opens a tool call with an empty `{}`
+                          // placeholder and then streams the real JSON. Appending
+                          // would produce `{}{...}`, which fails to parse and turns
+                          // the whole tool batch into a malformed-call retry. Treat
+                          // the placeholder as replaceable when the delta is itself
+                          // the start of an object.
+                          if (state.arguments.trim() === "{}" && argDelta.trimStart().startsWith("{")) {
+                            state.arguments = argDelta;
+                          } else {
+                            if (state.arguments.length + argDelta.length > MAX_TOOL_ARGUMENT_CHARS) {
+                              throw new Error(`Qoder tool arguments exceeded ${MAX_TOOL_ARGUMENT_CHARS} characters`);
+                            }
+                            state.arguments += argDelta;
+                          }
+                          if (state.arguments.length > MAX_TOOL_ARGUMENT_CHARS) {
                             throw new Error(`Qoder tool arguments exceeded ${MAX_TOOL_ARGUMENT_CHARS} characters`);
                           }
-                          state.arguments += argDelta;
                         }
                       }
                     }

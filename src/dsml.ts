@@ -75,17 +75,59 @@ function inferToolName(args: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+/** The subset of a host tool definition the DSML recovery needs. */
+export interface DsmlToolSchema {
+  name: string;
+  parameters?: unknown;
+}
+
+function schemaShape(parameters: unknown): { properties: Set<string>; required: string[] } | undefined {
+  if (!parameters || typeof parameters !== "object") return undefined;
+  const record = parameters as { properties?: unknown; required?: unknown };
+  if (!record.properties || typeof record.properties !== "object") return undefined;
+  const required = Array.isArray(record.required)
+    ? record.required.filter((key): key is string => typeof key === "string")
+    : [];
+  return { properties: new Set(Object.keys(record.properties as Record<string, unknown>)), required };
+}
+
+/**
+ * Recover the tool name by matching the arguments against the host's declared
+ * tool schemas. A candidate must accept every argument key and provide every
+ * required one; among those, the tool declaring the fewest extra parameters
+ * wins, since it is the most specific fit. This replaces guessing from a
+ * hardcoded parameter list whenever the caller supplies the real tool table.
+ */
+function matchToolBySchema(
+  args: Record<string, unknown>,
+  tools: readonly DsmlToolSchema[],
+): string | undefined {
+  const keys = Object.keys(args);
+  if (keys.length === 0) return undefined;
+  let best: { name: string; extra: number } | undefined;
+  for (const tool of tools) {
+    const shape = schemaShape(tool.parameters);
+    if (!shape) continue;
+    if (keys.some((key) => !shape.properties.has(key))) continue;
+    if (shape.required.some((key) => !(key in args))) continue;
+    const extra = shape.properties.size - keys.length;
+    if (!best || extra < best.extra) best = { name: tool.name, extra };
+  }
+  return best?.name;
+}
+
 /**
  * Parse Qoder's degenerate DSML: the `<invoke name="...">` opener is missing
  * entirely and only `<parameter>...</parameter>` plus closing tags survive,
  * e.g. `<parameter name="command">...</parameter>\n</invoke>\n</parameter>...`.
- * The tool name is inferred from the parameter shape.
+ * The tool name is recovered from the host schemas when available, else from
+ * the parameter shape.
  */
-function parseIncompleteInvocation(raw: string): DsmlToolCall | undefined {
+function parseIncompleteInvocation(raw: string, tools?: readonly DsmlToolSchema[]): DsmlToolCall | undefined {
   if (!/<\/invoke\s*>/i.test(raw)) return undefined;
   const args = extractParameters(raw);
   if (!args) return undefined;
-  const name = inferToolName(args);
+  const name = (tools ? matchToolBySchema(args, tools) : undefined) ?? inferToolName(args);
   return name ? { name, arguments: args } : undefined;
 }
 
@@ -145,6 +187,11 @@ export interface DsmlToolParserOptions {
   incompleteOnly?: boolean;
   /** Called instead of emitting text when a DSML invocation candidate cannot be parsed. */
   onMalformedInvocation?: (raw: string) => void;
+  /**
+   * The host's declared tools, used to recover the name of an opener-less
+   * invocation. Without it, recovery falls back to a small hardcoded map.
+   */
+  tools?: readonly DsmlToolSchema[];
 }
 
 /** Converts Qoder's occasional XML/DSML tool calls into pi tool-call events. */
@@ -187,7 +234,7 @@ export class DsmlToolParser {
         this.emitText(this.invocationBuffer);
       } else {
         if (this.invocationBuffer.includes(INVOKE_END)) {
-          tool = parseInvocation(this.invocationBuffer) ?? parseIncompleteInvocation(this.invocationBuffer);
+          tool = parseInvocation(this.invocationBuffer) ?? parseIncompleteInvocation(this.invocationBuffer, this.options.tools);
         }
         if (tool) this.emitTool(tool);
         else this.emitUnparsedInvocation(this.invocationBuffer);
@@ -238,7 +285,7 @@ export class DsmlToolParser {
         const after = this.invocationBuffer.slice(end + INVOKE_END.length);
         if (/^(?:\s*<\/(?:parameter|invoke|calls)\s*>)*\s*$/.test(after) || endsWithPartialTag(after)) return;
         const raw = this.invocationBuffer.slice(0, end + INVOKE_END.length);
-        const tool = parseInvocation(raw) ?? parseIncompleteInvocation(raw);
+        const tool = parseInvocation(raw) ?? parseIncompleteInvocation(raw, this.options.tools);
         if (tool) {
           this.emitTool(tool);
           this.textBuffer = this.invocationBuffer.slice(end + INVOKE_END.length).replace(TRAILING_CLOSES_PATTERN, "");

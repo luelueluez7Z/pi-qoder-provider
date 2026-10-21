@@ -19,8 +19,10 @@ import {
   getQoderUserEmailFallback,
   isQoderCNMode,
 } from "./cosy.js";
+import { logDebug } from "./debug-log.js";
 import { getCachedModelConfig } from "./models.js";
 import { resolveQoderIdentity } from "./oauth.js";
+import { trimQoderMessagesToBudget } from "./request-budget.js";
 import { transformMessagesForQoder, transformTools } from "./transform.js";
 import { checkQoderQuota } from "./usage.js";
 
@@ -190,6 +192,31 @@ export async function prepareQoderRequest(
   const currentTools = getCurrentTools(collapsed.messages);
   const toolsRaw = currentTools.length > 0 ? transformTools(currentTools) : undefined;
 
+  // Text budget: an oversized replay makes the gateway reject the request (or
+  // stall), so fit the messages under the model's window. System prompt and
+  // tool schemas count as overhead; images were already partly handled by the
+  // byte budget but still cost tokens here.
+  let budgetedMessages = normalizedMessages;
+  let droppedByBudget = 0;
+  let truncatedByBudget = 0;
+  if (contextWindow && contextWindow > 0) {
+    const overhead =
+      systemText.length + (toolsRaw ? JSON.stringify(toolsRaw).length : 0) + 4096; // fixed envelope fields
+    const budgeted = trimQoderMessagesToBudget(normalizedMessages, contextWindow, overhead);
+    budgetedMessages = budgeted.messages;
+    droppedByBudget = budgeted.droppedMessages;
+    truncatedByBudget = budgeted.truncatedMessages;
+  }
+  if (droppedByBudget > 0 || truncatedByBudget > 0) {
+    logDebug("budget", {
+      event: "text-budget",
+      qoderModel,
+      contextWindow,
+      droppedMessages: droppedByBudget,
+      truncatedMessages: truncatedByBudget,
+    });
+  }
+
   return {
     providerMode,
     accessToken,
@@ -202,7 +229,7 @@ export async function prepareQoderRequest(
     isReasoning,
     maxOutputTokens,
     systemText,
-    normalizedMessages,
+    normalizedMessages: budgetedMessages,
     lastUserText,
     sessionID,
     maxTokens,

@@ -475,6 +475,32 @@ describe("streamQoder", () => {
     expect((err as { error: AssistantMessage }).error.errorMessage).toContain("malformed SSE JSON");
   });
 
+  it("replaces an empty tool-arguments placeholder instead of concatenating onto it", async () => {
+    // Qoder sometimes opens the call with `{}` and then streams the real JSON.
+    // Appending produced `{}{...}`, which failed to parse and burned a retry.
+    const placeholderThenReal =
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, id: "call-placeholder", function: { name: "bash", arguments: "{}" } }],
+        }),
+      ) +
+      sseEnvelope(
+        chunk({
+          tool_calls: [{ index: 0, function: { arguments: '{"command":"Get-ChildItem"}' } }],
+        }),
+      ) +
+      sseEnvelope(finishChunk("tool_calls")) +
+      DONE_SSE;
+    globalThis.fetch = mockFetch(placeholderThenReal);
+
+    const events = await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const done = events.find((event) => event.type === "done") as { message: AssistantMessage } | undefined;
+    expect(done).toBeDefined();
+    const toolCall = done?.message.content.find((block) => block.type === "toolCall");
+    expect(toolCall).toMatchObject({ name: "bash", arguments: { command: "Get-ChildItem" } });
+  });
+
   it("rejects malformed tool arguments instead of executing an empty object", async () => {
     const malformedTool =
       sseEnvelope(

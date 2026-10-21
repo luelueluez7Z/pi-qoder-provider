@@ -665,14 +665,22 @@ const QODER_ERROR_HINTS: Record<string, string> = {
 /** Format an SSE-envelope upstream error into a readable message. */
 export function formatQoderUpstreamError(status: number, body: string, modelName?: string): string {
   const info = parseQoderUpstreamError(body);
-  if (!info) return `Upstream status ${status}: ${body}`;
 
-  if (info.code === "10605" && info.queue) {
+  if (info?.code === "10605" && info.queue) {
     return formatQoderQueueMessage(info.queue, modelName);
   }
 
-  const hint = QODER_ERROR_HINTS[info.code];
-  if (hint) return `${hint}（错误码 ${info.code}）`;
+  const hint = info ? QODER_ERROR_HINTS[info.code] : undefined;
+  if (hint) return `${hint}（错误码 ${info?.code}）`;
+
+  // pi only refreshes OAuth credentials once `expires` has passed, so a token
+  // Qoder invalidates early surfaces here as a bare 401/403 with no business
+  // code. Say what to do instead of letting it look like a transient fault.
+  if (status === 401 || status === 403) {
+    return `Qoder 凭证已失效或无权访问（HTTP ${status}）。请重新登录：/login qoder（国内版用 /login qoder-cn）。`;
+  }
+
+  if (!info) return `Upstream status ${status}: ${body}`;
   return `Qoder 上游返回错误（HTTP ${status}${info.code ? `，错误码 ${info.code}` : ""}）: ${info.message || body}`;
 }
 

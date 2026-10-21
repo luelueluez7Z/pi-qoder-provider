@@ -332,6 +332,23 @@ describe("formatQoderUpstreamError", () => {
     const msg = formatQoderUpstreamError(500, JSON.stringify({ code: "99999", message: "boom" }));
     expect(msg).toContain("boom");
   });
+
+  it("asks for a re-login when an unlabelled 401/403 arrives", () => {
+    // pi only refreshes OAuth credentials after `expires`, so a token Qoder
+    // invalidates early reaches the user as a bare 401/403.
+    const msg = formatQoderUpstreamError(401, JSON.stringify({ code: "401", message: "unauthorized" }));
+    expect(msg).toContain("凭证已失效");
+    expect(msg).toContain("/login qoder");
+  });
+
+  it("keeps a business code's hint even when the HTTP status is 403", () => {
+    const msg = formatQoderUpstreamError(
+      403,
+      JSON.stringify({ code: "403", message: JSON.stringify({ code: "112", message: "quota" }) }),
+    );
+    expect(msg).toContain("积分额度已用完");
+    expect(msg).not.toContain("凭证已失效");
+  });
 });
 
 describe("createQoderQueueError", () => {

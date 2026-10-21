@@ -79,6 +79,94 @@ describe("DsmlToolParser", () => {
     expect(tools).toEqual([{ name: "powershell", arguments: { command: "Get-ChildItem" } }]);
   });
 
+  it("recovers the tool name from the declared schemas instead of guessing", () => {
+    const text: string[] = [];
+    const tools: unknown[] = [];
+    const parser = new DsmlToolParser(
+      (value) => text.push(value),
+      (tool) => tools.push(tool),
+      {
+        tools: [
+          {
+            name: "shell",
+            parameters: {
+              type: "object",
+              properties: { command: { type: "string" }, timeout: { type: "number" } },
+              required: ["command"],
+            },
+          },
+          {
+            name: "grep",
+            parameters: {
+              type: "object",
+              properties: { pattern: { type: "string" }, path: { type: "string" } },
+              required: ["pattern"],
+            },
+          },
+        ],
+      },
+    );
+
+    parser.push('<parameter name="command">Get-ChildItem</parameter>\n</invoke>\n</calls>');
+    parser.finish();
+
+    expect(text.join("")).toBe("");
+    expect(tools).toEqual([{ name: "shell", arguments: { command: "Get-ChildItem" } }]);
+  });
+
+  it("prefers the most specific schema when several accept the arguments", () => {
+    const tools: unknown[] = [];
+    const parser = new DsmlToolParser(
+      () => {},
+      (tool) => tools.push(tool),
+      {
+        tools: [
+          {
+            name: "broad",
+            parameters: {
+              type: "object",
+              properties: { command: { type: "string" }, cwd: {}, timeout: {}, env: {} },
+            },
+          },
+          {
+            name: "narrow",
+            parameters: { type: "object", properties: { command: { type: "string" } } },
+          },
+        ],
+      },
+    );
+
+    parser.push('<parameter name="command">ls</parameter>\n</invoke>\n</calls>');
+    parser.finish();
+
+    expect(tools).toEqual([{ name: "narrow", arguments: { command: "ls" } }]);
+  });
+
+  it("falls back to the shape map when no declared schema fits", () => {
+    const tools: unknown[] = [];
+    const parser = new DsmlToolParser(
+      () => {},
+      (tool) => tools.push(tool),
+      {
+        tools: [
+          {
+            name: "grep",
+            parameters: {
+              type: "object",
+              properties: { pattern: { type: "string" }, path: { type: "string" } },
+              required: ["pattern"],
+            },
+          },
+        ],
+      },
+    );
+
+    parser.push('<parameter name="command">ls</parameter>\n</invoke>\n</calls>');
+    parser.finish();
+
+    expect(tools).toEqual([{ name: "powershell", arguments: { command: "ls" } }]);
+  });
+
   it("recovers a degenerate invocation split across deltas", () => {
     const text: string[] = [];
     const tools: unknown[] = [];

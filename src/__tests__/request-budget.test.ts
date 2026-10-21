@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { fitQoderImagesToBudget } from "../request-budget.js";
+import { fitQoderImagesToBudget, trimQoderMessagesToBudget } from "../request-budget.js";
 import type { transformMessagesForQoder } from "../transform.js";
 
 type Messages = ReturnType<typeof transformMessagesForQoder>;
 const image = (data: string) => ({ type: "image_url" as const, image_url: { url: `data:image/png;base64,${data}` } });
 const marker = { type: "text", text: "[Earlier image omitted to fit the request size limit.]" };
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+
+// 1 token ≈ 4 chars; the budget is 70% of contextWindow tokens.
+const windowFor = (chars: number) => Math.ceil(chars / 4 / 0.7);
+const text = (length: number) => "x".repeat(length);
 
 describe("fitQoderImagesToBudget", () => {
   it("leaves a request at the exact limit unchanged", () => {
@@ -71,5 +75,74 @@ describe("fitQoderImagesToBudget", () => {
   it("does not discard a sole oversized image", () => {
     const body = { messages: [{ role: "user", content: [image("a".repeat(1000))] }] as Messages };
     expect(() => fitQoderImagesToBudget(body, 100)).toThrow("最新图片");
+  });
+});
+
+describe("trimQoderMessagesToBudget", () => {
+  it("returns the same array when the request already fits", () => {
+    const messages = [
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi" },
+      { role: "user", content: "again" },
+    ] as Messages;
+    const result = trimQoderMessagesToBudget(messages, windowFor(10_000));
+    expect(result.messages).toBe(messages);
+    expect(result.droppedMessages).toBe(0);
+    expect(result.truncatedMessages).toBe(0);
+  });
+
+  it("drops the oldest messages first and keeps the last user message", () => {
+    const oldest = { role: "user", content: `oldest ${text(4000)}` };
+    const messages = [
+      oldest,
+      { role: "assistant", content: `middle ${text(4000)}` },
+      { role: "user", content: `newest ${text(4000)}` },
+    ] as Messages;
+    const result = trimQoderMessagesToBudget(messages, windowFor(6000));
+    expect(result.droppedMessages).toBeGreaterThan(0);
+    expect(result.messages.at(-1)).toEqual({ role: "user", content: `newest ${text(4000)}` });
+    expect(result.messages).not.toContainEqual(oldest);
+  });
+
+  it("never leaves an orphaned tool result when dropping", () => {
+    const messages = [
+      {
+        role: "assistant",
+        content: " ",
+        tool_calls: [{ id: "call-1", type: "function", function: { name: "read", arguments: text(3000) } }],
+      },
+      { role: "tool", tool_call_id: "call-1", content: text(3000) },
+      { role: "user", content: "now summarize" },
+    ] as Messages;
+    const result = trimQoderMessagesToBudget(messages, windowFor(3000));
+    const keptIds = new Set(
+      result.messages.filter((m) => m.role === "tool").map((m) => m.tool_call_id as string),
+    );
+    for (const message of result.messages) {
+      if (message.role !== "assistant" || !message.tool_calls) continue;
+      for (const call of message.tool_calls) {
+        if (call.id) expect(keptIds.has(call.id)).toBe(true);
+      }
+    }
+    expect(result.messages.at(-1)).toEqual({ role: "user", content: "now summarize" });
+  });
+
+  it("clips the last user message when nothing else can be dropped", () => {
+    const messages = [{ role: "user", content: text(200_000) }] as Messages;
+    const result = trimQoderMessagesToBudget(messages, windowFor(4000));
+    expect(result.droppedMessages).toBe(0);
+    expect(result.truncatedMessages).toBe(1);
+    expect((result.messages[0].content as string).length).toBeLessThan(200_000);
+  });
+
+  it("charges images a fixed token cost instead of their base64 length", () => {
+    const messages = [
+      { role: "user", content: [image("a".repeat(400_000))] },
+      { role: "user", content: "describe it" },
+    ] as Messages;
+    const result = trimQoderMessagesToBudget(messages, windowFor(20_000));
+    // The image costs 1000 tokens (~28000 chars at 4 chars/token in the
+    // estimate), which fits a 20k-char window; a base64-based count would not.
+    expect(result.droppedMessages).toBe(0);
   });
 });
