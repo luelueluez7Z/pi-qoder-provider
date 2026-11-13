@@ -9,20 +9,26 @@ import {
 } from "../models.js";
 
 describe("static model catalogs", () => {
-  it("global catalog exposes tier models", () => {
-    const ids = staticModels.map((m) => m.id);
-    expect(ids).toContain("auto");
-    expect(ids).toContain("ultimate");
-    expect(ids).toContain("performance");
-    expect(ids).toContain("efficient");
-    expect(ids).toContain("lite");
-  });
-
-  it("global catalog exposes concrete frontier models", () => {
-    const ids = staticModels.map((m) => m.id);
-    for (const key of ["qmodel", "cmodel", "qmodel_latest", "dmodel", "dfmodel", "gm51model", "kmodel", "mmodel"]) {
-      expect(ids).toContain(key);
-    }
+  it("global catalog mirrors the live catalog's model set", () => {
+    // Snapshot of /model/list; entries qoder dropped (performance, lite,
+    // qmodel, gm51model, qmodel_preview) must not linger as dead options.
+    expect(staticModels.map((m) => m.id)).toEqual([
+      "auto",
+      "ultimate",
+      "efficient",
+      "smodel",
+      "cmodel",
+      "qmodel_latest",
+      "qmodel_38max",
+      "qfmodel",
+      "kmodel_latest",
+      "kmodel",
+      "gmodel",
+      "gfmodel",
+      "dmodel",
+      "dfmodel",
+      "mmodel",
+    ]);
   });
 
   it("all global models point at the global gateway", () => {
@@ -69,16 +75,16 @@ describe("static model catalogs", () => {
 
   it("static catalogs carry price factors mirroring the live /model/list", () => {
     const byId = (id: string) => staticModels.find((m) => m.id === id)?.priceFactor;
-    expect(byId("auto")).toBe(1);
-    expect(byId("ultimate")).toBe(1.6);
-    expect(byId("performance")).toBe(1.1);
-    expect(byId("efficient")).toBe(0.3);
-    expect(byId("lite")).toBe(0);
-    expect(byId("cmodel")).toBe(3.2);
-    expect(byId("dmodel")).toBe(0.8);
-    expect(byId("dfmodel")).toBe(0.3);
-    expect(byId("qmodel_latest")).toBe(0.5);
-    expect(byId("qmodel")).toBe(0.1);
+    expect(byId("auto")).toBe(0.5);
+    expect(byId("ultimate")).toBe(2);
+    expect(byId("efficient")).toBe(0);
+    expect(byId("smodel")).toBe(8);
+    expect(byId("cmodel")).toBe(4);
+    expect(byId("qmodel_latest")).toBe(0.1);
+    expect(byId("kmodel")).toBe(0.8);
+    expect(byId("dmodel")).toBe(0.5);
+    expect(byId("dfmodel")).toBe(0.1);
+    expect(byId("mmodel")).toBe(0.1);
 
     const cnByFriendly = (id: string) => staticCnModels.find((m) => m.id === id)?.priceFactor;
     expect(cnByFriendly("auto")).toBe(1);
