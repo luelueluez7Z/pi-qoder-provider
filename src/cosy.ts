@@ -344,7 +344,12 @@ const GLOBAL_FRIENDLY_MODELS: Record<string, { id: string; name: string }> = {
 };
 
 export function getQoderGlobalFriendlyModelInfo(key: string, display?: string): { id: string; name: string } {
-  return GLOBAL_FRIENDLY_MODELS[key] || { id: key, name: display || key };
+  const mapped = GLOBAL_FRIENDLY_MODELS[key];
+  // Keep the mapped id (saved sessions and settings reference it) but prefer
+  // qoder's live display_name, since the table goes stale when qoder renames a
+  // model upstream (e.g. Qwen4-Max-Preview is still "Qwen 3.7 Max" here).
+  if (display && display !== key) return { id: mapped?.id || key, name: display };
+  return mapped || { id: key, name: display || key };
 }
 
 export function toQoderGlobalFriendlyModel<T extends { id: string; name: string }>(model: T): T {

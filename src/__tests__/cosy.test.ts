@@ -207,15 +207,19 @@ describe("getQoderGlobalDirectModel", () => {
 });
 
 describe("toQoderGlobalFriendlyModel", () => {
-  it("maps dmodel/dfmodel to friendly names", () => {
-    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-V4-Flash" }).id).toBe("deepseek-v4-flash");
-    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-V4-Flash" }).name).toBe("DeepSeek V4 Flash");
-    expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).id).toBe("deepseek-v4-pro");
-    expect(toQoderGlobalFriendlyModel({ id: "dmodel", name: "DeepSeek-V4-Pro" }).name).toBe("DeepSeek V4 Pro");
-    expect(toQoderGlobalFriendlyModel({ id: "qfmodel", name: "Qwen3.8-Flash" }).id).toBe("qwen3.8-flash");
-    expect(toQoderGlobalFriendlyModel({ id: "qfmodel", name: "Qwen3.8-Flash" }).name).toBe("Qwen 3.8 Flash");
-    expect(toQoderGlobalFriendlyModel({ id: "gfmodel", name: "GLM-5.3-Flash" }).id).toBe("glm-5.3-flash");
-    expect(toQoderGlobalFriendlyModel({ id: "gfmodel", name: "GLM-5.3-Flash" }).name).toBe("GLM 5.3 Flash");
+  it("keeps the friendly id but uses qoder's live display name", () => {
+    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-Flash" }).id).toBe("deepseek-v4-flash");
+    expect(toQoderGlobalFriendlyModel({ id: "dfmodel", name: "DeepSeek-Flash" }).name).toBe("DeepSeek-Flash");
+    expect(toQoderGlobalFriendlyModel({ id: "qmodel_latest", name: "Qwen4-Max-Preview" }).id).toBe("qwen3.7-max");
+    expect(toQoderGlobalFriendlyModel({ id: "qmodel_latest", name: "Qwen4-Max-Preview" }).name).toBe(
+      "Qwen4-Max-Preview",
+    );
+    expect(toQoderGlobalFriendlyModel({ id: "mmodel", name: "MiniMax-M3.1-Flash" }).id).toBe("minimax-m3");
+    expect(toQoderGlobalFriendlyModel({ id: "mmodel", name: "MiniMax-M3.1-Flash" }).name).toBe("MiniMax-M3.1-Flash");
+  });
+
+  it("falls back to the static table name when no display name is given", () => {
+    expect(toQoderGlobalFriendlyModel({ id: "mmodel", name: "mmodel" }).name).toBe("MiniMax M3");
   });
 
   it("round-trips friendly id back to internal key", () => {
