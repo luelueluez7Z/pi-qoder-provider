@@ -323,6 +323,26 @@ export function streamQoder(
         try {
           if (options?.signal?.aborted) throw new Error("aborted");
           requestId = crypto.randomUUID();
+          // Qoder books a call from business.model_key plus a model_config shaped
+          // like its own client's; a whole catalog entry (minimal_version,
+          // strategies, price_factor, …) or a missing model_key is booked as Auto.
+          const wireModelConfig = {
+            key: qoderModel,
+            display_name: modelConfig.display_name || qoderModel,
+            ...(typeof modelConfig.outer_provider === "string"
+              ? { outer_provider: modelConfig.outer_provider }
+              : { model: "" }),
+            format: typeof modelConfig.format === "string" ? modelConfig.format : "openai",
+            is_vl: !!modelConfig.is_vl,
+            is_reasoning: !!modelConfig.is_reasoning && enableThinking,
+            api_key: "",
+            url: "",
+            source: modelConfig.source || "system",
+            max_input_tokens:
+              typeof modelConfig.max_input_tokens === "number" && modelConfig.max_input_tokens > 0
+                ? modelConfig.max_input_tokens
+                : 200000,
+          };
           const reqBody = {
             request_id: requestId,
             request_set_id: recordID,
@@ -368,11 +388,12 @@ export function streamQoder(
               features: [],
               text: requestLastUserText,
             },
-            model_config: modelConfig,
+            model_config: wireModelConfig,
             business: {
               product: "cli",
               version: "1.0.0",
               type: "agent",
+              model_key: qoderModel,
               stage: "start",
               id: crypto.randomUUID(),
               name: requestLastUserText.substring(0, 30),

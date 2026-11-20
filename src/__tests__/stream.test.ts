@@ -914,6 +914,25 @@ describe("streamQoder", () => {
     expect(msg.usage.cost.output).toBe(0);
   });
 
+  it("names the billed model in business and sends a client-shaped model_config", async () => {
+    const fetchMock = mockFetch(SUCCESS_SSE) as unknown as ReturnType<typeof vi.fn>;
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    await consume(streamQoder(makeModel(), makeContext(), { apiKey: "fake" }));
+
+    const call = fetchMock.mock.calls.find((c) => !/userinfo|quota\/usage/.test(String(c[0])));
+    expect(call, "expected a chat request").toBeDefined();
+    const request = JSON.parse(decodeQoderBody(Buffer.from(call?.[1]?.body as Buffer).toString("utf8")));
+    const mc = request.model_config;
+    // Without these Qoder books the call as Auto whatever model was asked for.
+    expect(mc.key).toBe(request.business.model_key);
+    expect(mc.key).toBe("ultimate");
+    // Catalog-only fields must not ride along in the request body.
+    for (const key of ["price_factor", "minimal_version", "strategies", "context_config", "thinking_config", "enable"]) {
+      expect(mc).not.toHaveProperty(key);
+    }
+    expect(mc).toMatchObject({ model: "", api_key: "", url: "" });
+  });
+
   it("reports a tool_use stop reason when the stream emits tool calls", async () => {
     const sse =
       sseEnvelope(
