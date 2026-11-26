@@ -178,16 +178,10 @@ export async function prepareQoderRequest(
   if (maxOutputTokens > 0) maxTokens = maxOutputTokens;
   if (options?.maxTokens && options.maxTokens < maxTokens) maxTokens = options.maxTokens;
 
-  // A request this small (a session title, a classification) has no room to
-  // think in: thinking would spend the whole budget on reasoning and end at
-  // "length" with no text at all.
-  const tooSmallToThink = maxTokens > 0 && maxTokens <= 1024;
-
   // Map pi's thinking level to the wire level carried by both transports.
   // Levels are none/low/medium/high/xhigh/max; "off"/"minimal" mean none.
   const reasoningLevel = (options?.reasoning as string | undefined) ?? "off";
-  const reasoningEffort =
-    tooSmallToThink || reasoningLevel === "off" || reasoningLevel === "minimal" ? "none" : reasoningLevel;
+  const reasoningEffort = reasoningLevel === "off" || reasoningLevel === "minimal" ? "none" : reasoningLevel;
   const enableThinking = reasoningEffort !== "none";
 
   // Context window: pi's streamSimple has no contextWindow option, so honor

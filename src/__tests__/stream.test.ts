@@ -933,35 +933,6 @@ describe("streamQoder", () => {
     expect(mc).toMatchObject({ model: "", api_key: "", url: "" });
   });
 
-  it("asks for no thinking when the request budget is too small to think in", async () => {
-    const fetchMock = mockFetch(SUCCESS_SSE) as unknown as ReturnType<typeof vi.fn>;
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-    await consume(
-      streamQoder(makeModel(), makeContext(), { apiKey: "fake", reasoning: "high", maxTokens: 512 } as never),
-    );
-
-    const call = fetchMock.mock.calls.find((c) => !/userinfo|quota\/usage/.test(String(c[0])));
-    const request = JSON.parse(decodeQoderBody(Buffer.from(call?.[1]?.body as Buffer).toString("utf8")));
-    // Thinking here would spend all 512 tokens on reasoning and stop at "length".
-    expect(request.parameters).toMatchObject({
-      enable_thinking: false,
-      reasoning_effort: "none",
-      max_tokens: 512,
-    });
-  });
-
-  it("keeps the asked thinking level when the request has room to think", async () => {
-    const fetchMock = mockFetch(SUCCESS_SSE) as unknown as ReturnType<typeof vi.fn>;
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-    await consume(
-      streamQoder(makeModel(), makeContext(), { apiKey: "fake", reasoning: "high", maxTokens: 4096 } as never),
-    );
-
-    const call = fetchMock.mock.calls.find((c) => !/userinfo|quota\/usage/.test(String(c[0])));
-    const request = JSON.parse(decodeQoderBody(Buffer.from(call?.[1]?.body as Buffer).toString("utf8")));
-    expect(request.parameters).toMatchObject({ enable_thinking: true, reasoning_effort: "high", max_tokens: 4096 });
-  });
-
   it("reports a tool_use stop reason when the stream emits tool calls", async () => {
     const sse =
       sseEnvelope(
